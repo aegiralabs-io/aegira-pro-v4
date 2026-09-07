@@ -1,0 +1,565 @@
+[
+  {
+    "id": "connection_refused",
+    "name": "Connection Refused",
+    "severity": "high",
+    "error_patterns": [
+      "connection refused",
+      "connection was refused",
+      "connect refused"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "database_connection_failed",
+    "name": "Database Connection Failed",
+    "severity": "high",
+    "error_patterns": [
+      "database connection failed",
+      "failed to connect to database"
+    ],
+    "context_patterns": [
+      "database"
+    ],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 20
+  },
+  {
+    "id": "connection_reset",
+    "name": "Connection Reset",
+    "severity": "high",
+    "error_patterns": [
+      "connection reset",
+      "connection was reset"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "broken_pipe",
+    "name": "Broken Pipe",
+    "severity": "medium",
+    "error_patterns": [
+      "broken pipe"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "service_unavailable",
+    "name": "Service Unavailable",
+    "severity": "high",
+    "error_patterns": [
+      "service unavailable",
+      "service is unavailable"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "out_of_memory",
+    "name": "Out Of Memory",
+    "severity": "critical",
+    "error_patterns": [
+      "out of memory",
+      "oom killed",
+      "out-of-memory"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 15
+  },
+  {
+    "id": "segmentation_fault",
+    "name": "Segmentation Fault",
+    "severity": "critical",
+    "error_patterns": [
+      "segmentation fault",
+      "segfault"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 15
+  },
+  {
+    "id": "address_already_in_use",
+    "name": "Address Already In Use",
+    "severity": "high",
+    "error_patterns": [
+      "address already in use",
+      "address in use",
+      "bind: address already in use"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 15
+  },
+  {
+    "id": "too_many_open_files",
+    "name": "Too Many Open Files",
+    "severity": "high",
+    "error_patterns": [
+      "too many open files",
+      "too many open file descriptors"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 15
+  },
+  {
+    "id": "process_killed",
+    "name": "Process Killed",
+    "severity": "critical",
+    "error_patterns": [
+      "process killed",
+      "process was killed",
+      "killed by signal"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 5
+  },
+  {
+    "id": "request_timeout",
+    "name": "Request Timeout",
+    "severity": "high",
+    "error_patterns": [
+      "request timeout",
+      "operation timed out",
+      "timed out",
+      "request timed out"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "permission_denied",
+    "name": "Permission Denied",
+    "severity": "high",
+    "error_patterns": [
+      "permission denied",
+      "access denied",
+      "permission is denied"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "no_space_left",
+    "name": "No Space Left On Device",
+    "severity": "critical",
+    "error_patterns": [
+      "no space left on device",
+      "disk full",
+      "no space left"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 20
+  },
+  {
+    "id": "file_not_found",
+    "name": "File Not Found",
+    "severity": "medium",
+    "error_patterns": [
+      "no such file or directory",
+      "file not found",
+      "no such file"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 5
+  },
+  {
+    "id": "connection_timed_out",
+    "name": "Connection Timed Out",
+    "severity": "high",
+    "error_patterns": [
+      "connection timed out",
+      "connect timeout",
+      "connection timeout"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "ssl_error",
+    "name": "SSL Error",
+    "severity": "high",
+    "error_patterns": [
+      "ssl error",
+      "tls handshake failed",
+      "certificate verify failed",
+      "certificate validation failed"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "resource_unavailable",
+    "name": "Resource Temporarily Unavailable",
+    "severity": "high",
+    "error_patterns": [
+      "resource temporarily unavailable",
+      "temporarily unavailable"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 10
+  },
+  {
+    "id": "failed_to_start",
+    "name": "Service Failed To Start",
+    "severity": "critical",
+    "error_patterns": [
+      "failed to start",
+      "startup failed",
+      "failed during startup"
+    ],
+    "context_patterns": [],
+    "remediation": {
+      "type": "service_restart",
+      "service": "TARGET_SERVICE"
+    },
+    "verification": {
+      "type": "service_active",
+      "service": "TARGET_SERVICE"
+    },
+    "priority": 20
+  },
+  {
+    "id": "docker_oom_restart",
+    "name": "Docker OOM",
+    "severity": "critical",
+    "trigger": {
+      "type": "docker_oom",
+      "container": "TARGET_CONTAINER"
+    },
+    "error_patterns": [
+      "oom event detected"
+    ],
+    "context_patterns": [
+      "docker container"
+    ],
+    "remediation": {
+      "type": "container_restart",
+      "container": "TARGET_CONTAINER"
+    },
+    "verification": {
+      "type": "container_running",
+      "container": "TARGET_CONTAINER"
+    },
+    "priority": 30
+  },
+  {
+    "id": "docker_health_unhealthy",
+    "name": "Docker Healthcheck Unhealthy",
+    "severity": "critical",
+    "trigger": {
+      "type": "docker_health",
+      "container": "TARGET_CONTAINER",
+      "status": "unhealthy"
+    },
+    "error_patterns": [
+      "health status unhealthy"
+    ],
+    "context_patterns": [
+      "docker container"
+    ],
+    "remediation": {
+      "type": "container_restart",
+      "container": "TARGET_CONTAINER"
+    },
+    "verification": {
+      "type": "container_healthy",
+      "container": "TARGET_CONTAINER"
+    },
+    "priority": 30
+  },
+  {
+    "id": "docker_exit_125",
+    "name": "Docker Daemon / Run Failure",
+    "severity": "high",
+    "trigger": {
+      "type": "docker_exit",
+      "container": "TARGET_CONTAINER",
+      "exit_codes": [
+        125
+      ]
+    },
+    "error_patterns": [
+      "exited",
+      "exit code 125"
+    ],
+    "context_patterns": [
+      "docker container"
+    ],
+    "remediation": {
+      "type": "alert_only"
+    },
+    "verification": {
+      "type": "none"
+    },
+    "priority": 25
+  },
+  {
+    "id": "docker_exit_137",
+    "name": "Docker SIGKILL / OOM Candidate",
+    "severity": "high",
+    "trigger": {
+      "type": "docker_exit",
+      "container": "TARGET_CONTAINER",
+      "exit_codes": [
+        137
+      ]
+    },
+    "error_patterns": [
+      "exited",
+      "exit code 137"
+    ],
+    "context_patterns": [
+      "docker container"
+    ],
+    "remediation": {
+      "type": "alert_only"
+    },
+    "verification": {
+      "type": "none"
+    },
+    "priority": 25
+  },
+  {
+    "id": "docker_exit_139",
+    "name": "Docker Segmentation Fault Exit",
+    "severity": "critical",
+    "trigger": {
+      "type": "docker_exit",
+      "container": "TARGET_CONTAINER",
+      "exit_codes": [
+        139
+      ]
+    },
+    "error_patterns": [
+      "exited",
+      "exit code 139"
+    ],
+    "context_patterns": [
+      "docker container"
+    ],
+    "remediation": {
+      "type": "container_restart",
+      "container": "TARGET_CONTAINER"
+    },
+    "verification": {
+      "type": "container_running",
+      "container": "TARGET_CONTAINER"
+    },
+    "priority": 25
+  },
+  {
+    "id": "docker_exit_126",
+    "name": "Docker Command Not Executable",
+    "severity": "high",
+    "trigger": {
+      "type": "docker_exit",
+      "container": "TARGET_CONTAINER",
+      "exit_codes": [
+        126
+      ]
+    },
+    "error_patterns": [
+      "exited",
+      "exit code 126"
+    ],
+    "context_patterns": [
+      "docker container"
+    ],
+    "remediation": {
+      "type": "alert_only"
+    },
+    "verification": {
+      "type": "none"
+    },
+    "priority": 25
+  },
+  {
+    "id": "docker_exit_127",
+    "name": "Docker Command Not Found",
+    "severity": "high",
+    "trigger": {
+      "type": "docker_exit",
+      "container": "TARGET_CONTAINER",
+      "exit_codes": [
+        127
+      ]
+    },
+    "error_patterns": [
+      "exited",
+      "exit code 127"
+    ],
+    "context_patterns": [
+      "docker container"
+    ],
+    "remediation": {
+      "type": "alert_only"
+    },
+    "verification": {
+      "type": "none"
+    },
+    "priority": 25
+  },
+  {
+    "id": "docker_exit_143",
+    "name": "Docker SIGTERM / Manual Stop",
+    "severity": "medium",
+    "trigger": {
+      "type": "docker_exit",
+      "container": "TARGET_CONTAINER",
+      "exit_codes": [
+        143
+      ]
+    },
+    "error_patterns": [
+      "exited",
+      "exit code 143"
+    ],
+    "context_patterns": [
+      "docker container"
+    ],
+    "remediation": {
+      "type": "alert_only"
+    },
+    "verification": {
+      "type": "none"
+    },
+    "priority": 20
+  }
+]

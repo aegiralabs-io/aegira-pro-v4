@@ -1,0 +1,35 @@
+[
+  {
+    "id": "my_app_exit_42",
+    "name": "My App Exit Code 42",
+    "severity": "high",
+    "trigger": {"type": "docker_exit", "container": "my-app", "exit_codes": [42]},
+    "error_patterns": ["exited", "exit code 42"],
+    "context_patterns": ["docker container"],
+    "remediation": {"type": "command", "executable": "/usr/local/bin/recover-my-app", "args": ["my-app", "{EXIT_CODE}"]},
+    "verification": {"type": "container_probe_success", "container": "my-app", "executable": "wget", "args": ["-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]},
+    "priority": 30
+  },
+  {
+    "id": "internal_api_probe",
+    "name": "Internal API Probe",
+    "severity": "critical",
+    "trigger": {"type": "container_probe", "container": "my-app", "executable": "wget", "args": ["-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"], "interval_secs": 5},
+    "error_patterns": ["probe", "failed"],
+    "context_patterns": ["my-app"],
+    "remediation": {"type": "container_restart", "container": "my-app"},
+    "verification": {"type": "container_probe_success", "container": "my-app", "executable": "wget", "args": ["-q", "-O", "/dev/null", "http://127.0.0.1:8080/health"]},
+    "priority": 35
+  },
+  {
+    "id": "public_api_health",
+    "name": "Public API Health",
+    "severity": "critical",
+    "trigger": {"type": "http_health", "url": "http://127.0.0.1:8080/health", "expected_status": 200, "interval_secs": 5},
+    "error_patterns": ["HTTP health check failed"],
+    "context_patterns": ["health check"],
+    "remediation": {"type": "container_restart", "container": "my-app"},
+    "verification": {"type": "http_status", "url": "http://127.0.0.1:8080/health", "expected_status": 200},
+    "priority": 35
+  }
+]

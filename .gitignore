@@ -1,0 +1,7 @@
+target/
+*.log
+/etc/aegira/config.json
+*.env
+.env
+*.key
+*.pem
