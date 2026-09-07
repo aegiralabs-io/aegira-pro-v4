@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread::sleep;
@@ -227,6 +227,9 @@ enum Remediation {
 
     #[serde(rename = "container_exec")]
     ContainerExec { container: String, #[serde(default)] args: Vec<String> },
+
+    #[serde(rename = "command_sequence")]
+    CommandSequence { #[serde(default)] commands: Vec<String> },
 
     #[serde(rename = "alert_only")]
     AlertOnly,
@@ -461,6 +464,11 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
             validate_target_name(container, "Container")?;
             if args.is_empty() || args.len() > 64 || args.iter().any(|a| a.len() > 4096) {
                 return Err(format!("Rule '{}' container_exec requires 1-64 reasonable arguments", rule.id));
+            }
+        }
+        Remediation::CommandSequence { commands } => {
+            if commands.is_empty() || commands.len() > 64 || commands.iter().any(|c| c.trim().is_empty() || c.len() > 8192) {
+                return Err(format!("Rule '{}' command_sequence requires 1-64 non-empty commands", rule.id));
             }
         }
         Remediation::AlertOnly => {}
@@ -971,6 +979,88 @@ fn execute_command_capture(executable: &str, args: &[String], timeout_secs: u64)
     }
 }
 
+fn execute_command_sequence(commands: &[String], ctx: Option<&IncidentContext>, rule: &Rule) -> Result<(), String> {
+    if commands.is_empty() {
+        return Err("Command sequence is empty".to_string());
+    }
+
+    log_incident(&format!("[RECOVERY] Executing command sequence ({} commands)", commands.len()));
+
+    for (index, raw_command) in commands.iter().enumerate() {
+        let command = expand_command_arg(raw_command, ctx, rule);
+        log_incident(&format!("[COMMAND {} / {}] {}", index + 1, commands.len(), command));
+
+        #[cfg(unix)]
+        let shell = "/bin/sh";
+        #[cfg(not(unix))]
+        let shell = "cmd";
+
+        #[cfg(unix)]
+        let shell_args = vec!["-c", command.as_str()];
+        #[cfg(not(unix))]
+        let shell_args = vec!["/C", command.as_str()];
+
+        let mut child = Command::new(shell)
+            .args(&shell_args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("Command {} failed to start: {}", index + 1, e))?;
+
+        let start = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let stdout = child.stdout.take().map(|mut r| {
+                        let mut buf = String::new();
+                        let _ = r.read_to_string(&mut buf);
+                        buf
+                    }).unwrap_or_default();
+                    let stderr = child.stderr.take().map(|mut r| {
+                        let mut buf = String::new();
+                        let _ = r.read_to_string(&mut buf);
+                        buf
+                    }).unwrap_or_default();
+
+                    if status.success() {
+                        continue;
+                    }
+
+                    let detail = if !stderr.trim().is_empty() {
+                        format!(" stderr={}", stderr.trim())
+                    } else if !stdout.trim().is_empty() {
+                        format!(" stdout={}", stdout.trim())
+                    } else {
+                        String::new()
+                    };
+
+                    return Err(format!(
+                        "Command {} exited with status {}.{}",
+                        index + 1, status, detail
+                    ));
+                }
+                Ok(None) if start.elapsed() >= Duration::from_secs(COMMAND_TIMEOUT_SECS) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(format!(
+                        "Command {} timed out after {} seconds",
+                        index + 1, COMMAND_TIMEOUT_SECS
+                    ));
+                }
+                Ok(None) => sleep(Duration::from_millis(100)),
+                Err(e) => {
+                    return Err(format!(
+                        "Failed waiting for command {}: {}",
+                        index + 1, e
+                    ));
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn expand_command_arg(arg: &str, ctx: Option<&IncidentContext>, rule: &Rule) -> String {
     let mut out = arg.to_string();
     if let Some(c) = ctx {
@@ -1152,6 +1242,9 @@ fn perform_remediation(remediation: &Remediation, ctx: Option<&IncidentContext>,
             let (code, stdout, stderr) = execute_command_capture(docker, &full, COMMAND_TIMEOUT_SECS)?;
             if code == 0 { Ok(()) } else { Err(format!("docker exec {} failed with code {}. stdout={} stderr={}", target, code, stdout.trim(), stderr.trim())) }
         }
+        Remediation::CommandSequence { commands } => {
+            execute_command_sequence(commands, ctx, rule)
+        }
         Remediation::AlertOnly => Err("Alert-only rule does not perform remediation".to_string()),
     }
 }
@@ -1287,6 +1380,11 @@ fn describe_remediation(remediation: &Remediation) -> String {
         Remediation::ContainerRestart { container } => format!("docker restart {}", container),
         Remediation::Command { executable, args } => format!("{} {}", executable, args.join(" ")),
         Remediation::ContainerExec { container, args } => format!("docker exec {} {}", container, args.join(" ")),
+        Remediation::CommandSequence { commands } => format!(
+            "{} command(s): {}",
+            commands.len(),
+            commands.join(" && ")
+        ),
         Remediation::AlertOnly => "no remediation".to_string(),
     }
 }
@@ -1933,6 +2031,22 @@ mod tests {
         };
         let out = expand_command_arg("{CONTAINER}:{EXIT_CODE}:{RULE_ID}:{SOURCE}:{INCIDENT}", Some(&ctx), &rule);
         assert!(out.contains("my-app:42:rule-42:docker_exit:container x failed"));
+    }
+
+    #[test]
+    fn parses_command_sequence_remediation() {
+        let json = r#"{
+            "id":"sequence",
+            "name":"sequence",
+            "error_patterns":["sequence"],
+            "remediation":{"type":"command_sequence","commands":["true","true"]},
+            "verification":{"type":"none"}
+        }"#;
+        let rule: Rule = serde_json::from_str(json).unwrap();
+        match rule.remediation {
+            Remediation::CommandSequence { commands } => assert_eq!(commands.len(), 2),
+            _ => panic!("expected command_sequence remediation"),
+        }
     }
 
     #[test]
