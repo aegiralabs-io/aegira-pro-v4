@@ -3,10 +3,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 
@@ -65,6 +64,7 @@ struct AlertConfig {
     notify_on_recovery: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct RuleFileFingerprint {
     files: Vec<(String, u64, u64)>,
 }
@@ -633,6 +633,7 @@ fn get_hardcoded_default_rules() -> Vec<Rule> {
         ],
 
         context_patterns: Vec::new(),
+        trigger: Trigger::Log,
 
         remediation: Remediation::ServiceRestart {
             service: "cron".to_string(),
