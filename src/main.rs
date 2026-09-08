@@ -26,6 +26,7 @@ const MAX_INCIDENT_LOG_BYTES: u64 = 10 * 1024 * 1024;
 const DOCKER_EVENT_RECONNECT_SECS: u64 = 3;
 const DOCKER_LOG_TAIL_LINES: u32 = 80;
 const API_HEALTH_POLL_SECS: u64 = 5;
+const MAX_COMMAND_SEQUENCE_LENGTH: usize = 5;
 
 const MIN_MATCH_SCORE: i32 = 60;
 const SELF_SERVICE: &str = "aegira";
@@ -229,7 +230,12 @@ enum Remediation {
     ContainerExec { container: String, #[serde(default)] args: Vec<String> },
 
     #[serde(rename = "command_sequence")]
-    CommandSequence { #[serde(default)] commands: Vec<String> },
+    CommandSequence {
+        #[serde(default)]
+        commands: Vec<String>,
+        #[serde(default)]
+        verifications: Vec<Verification>,
+    },
 
     #[serde(rename = "alert_only")]
     AlertOnly,
@@ -403,6 +409,57 @@ fn validate_target_name(value: &str, kind: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn command_contains_docker_restart(command: &str) -> bool {
+    let tokens: Vec<&str> = command
+        .split_whitespace()
+        .map(|token| token.trim_matches(|c: char| matches!(c, '\'' | '"' | ';' | '&')))
+        .collect();
+
+    tokens.windows(2).any(|pair| {
+        let executable = pair[0].rsplit('/').next().unwrap_or(pair[0]);
+        executable.eq_ignore_ascii_case("docker") && pair[1].eq_ignore_ascii_case("restart")
+    })
+}
+
+fn validate_verification(verification: &Verification, rule_id: &str, allow_none: bool) -> Result<(), String> {
+    match verification {
+        Verification::ServiceActive { service } => {
+            validate_target_name(service, "Verification service")?;
+        }
+        Verification::ContainerRunning { container } => {
+            validate_target_name(container, "Verification container")?;
+        }
+        Verification::ContainerHealthy { container } => {
+            validate_target_name(container, "Verification healthy container")?;
+        }
+        Verification::ContainerProbeSuccess { container, executable, args } => {
+            validate_target_name(container, "Verification probe container")?;
+            if executable.trim().is_empty() || executable.len() > 512 || args.len() > 64 || args.iter().any(|a| a.len() > 4096) {
+                return Err(format!("Rule '{}' has invalid container probe verification", rule_id));
+            }
+        }
+        Verification::HttpStatus { url, expected_status } => {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!("Rule '{}' HTTP verification URL must start with http:// or https://", rule_id));
+            }
+            if *expected_status == 0 {
+                return Err(format!("Rule '{}' has invalid HTTP verification status", rule_id));
+            }
+        }
+        Verification::CommandSuccess { executable, args } => {
+            if executable.trim().is_empty() || executable.len() > 512 || args.len() > 64 || args.iter().any(|a| a.len() > 4096) {
+                return Err(format!("Rule '{}' has invalid command verification", rule_id));
+            }
+        }
+        Verification::None if allow_none => {}
+        Verification::None => {
+            return Err(format!("Rule '{}' requires a real verification", rule_id));
+        }
+    }
+
+    Ok(())
+}
+
 fn validate_rule(rule: &Rule) -> Result<(), String> {
     if rule.id.trim().is_empty() {
         return Err(
@@ -466,35 +523,46 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
                 return Err(format!("Rule '{}' container_exec requires 1-64 reasonable arguments", rule.id));
             }
         }
-        Remediation::CommandSequence { commands } => {
-            if commands.is_empty() || commands.len() > 64 || commands.iter().any(|c| c.trim().is_empty() || c.len() > 8192) {
-                return Err(format!("Rule '{}' command_sequence requires 1-64 non-empty commands", rule.id));
+        Remediation::CommandSequence { commands, verifications } => {
+            if commands.is_empty() || commands.len() > MAX_COMMAND_SEQUENCE_LENGTH {
+                return Err(format!(
+                    "Rule '{}' command_sequence requires 1-{} commands",
+                    rule.id, MAX_COMMAND_SEQUENCE_LENGTH
+                ));
+            }
+
+            if commands.iter().any(|c| c.trim().is_empty() || c.len() > 8192) {
+                return Err(format!(
+                    "Rule '{}' command_sequence contains an empty or oversized command",
+                    rule.id
+                ));
+            }
+
+            if verifications.len() != commands.len() {
+                return Err(format!(
+                    "Rule '{}' command_sequence requires exactly one verification per command",
+                    rule.id
+                ));
+            }
+
+            for verification in verifications {
+                validate_verification(verification, &rule.id, false)?;
+            }
+
+            for (index, command) in commands.iter().enumerate() {
+                if command_contains_docker_restart(command) && index != commands.len() - 1 {
+                    return Err(format!(
+                        "Rule '{}' docker restart must be the final command in a command_sequence",
+                        rule.id
+                    ));
+                }
             }
         }
         Remediation::AlertOnly => {}
     }
 
 
-    match &rule.verification {
-        Verification::ServiceActive { service } => validate_target_name(service, "Verification service")?,
-        Verification::ContainerRunning { container } => validate_target_name(container, "Verification container")?,
-        Verification::ContainerHealthy { container } => validate_target_name(container, "Verification healthy container")?,
-        Verification::ContainerProbeSuccess { container, executable, args } => {
-            validate_target_name(container, "Verification probe container")?;
-            if executable.trim().is_empty() || args.len() > 64 { return Err(format!("Rule '{}' has invalid container probe verification", rule.id)); }
-        }
-        Verification::HttpStatus { url, .. } => {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
-                return Err(format!("Rule '{}' HTTP verification URL must start with http:// or https://", rule.id));
-            }
-        }
-        Verification::CommandSuccess { executable, args } => {
-            if executable.trim().is_empty() || executable.len() > 512 || args.len() > 64 {
-                return Err(format!("Rule '{}' has invalid command verification", rule.id));
-            }
-        }
-        Verification::None => {}
-    }
+    validate_verification(&rule.verification, &rule.id, true)?;
 
     match &rule.trigger {
         Trigger::Log => {}
@@ -979,16 +1047,56 @@ fn execute_command_capture(executable: &str, args: &[String], timeout_secs: u64)
     }
 }
 
-fn execute_command_sequence(commands: &[String], ctx: Option<&IncidentContext>, rule: &Rule) -> Result<(), String> {
+fn execute_command_sequence(
+    commands: &[String],
+    verifications: &[Verification],
+    ctx: Option<&IncidentContext>,
+    rule: &Rule,
+) -> Result<(), String> {
     if commands.is_empty() {
         return Err("Command sequence is empty".to_string());
     }
 
-    log_incident(&format!("[RECOVERY] Executing command sequence ({} commands)", commands.len()));
+    if commands.len() > MAX_COMMAND_SEQUENCE_LENGTH {
+        return Err(format!(
+            "Command sequence exceeds maximum of {} commands",
+            MAX_COMMAND_SEQUENCE_LENGTH
+        ));
+    }
+
+    if verifications.len() != commands.len() {
+        return Err(format!(
+            "Command sequence has {} commands but {} verifications; every command must have exactly one verification",
+            commands.len(),
+            verifications.len()
+        ));
+    }
+
+    if verifications.iter().any(|v| matches!(v, Verification::None)) {
+        return Err("Command sequence requires a real verification after every command".to_string());
+    }
+
+    for (index, command) in commands.iter().enumerate() {
+        if command_contains_docker_restart(command) && index != commands.len() - 1 {
+            return Err("docker restart must be the final command in a command_sequence".to_string());
+        }
+    }
+
+    log_incident(&format!(
+        "[RECOVERY] Executing command sequence ({} commands)",
+        commands.len()
+    ));
 
     for (index, raw_command) in commands.iter().enumerate() {
         let command = expand_command_arg(raw_command, ctx, rule);
-        log_incident(&format!("[COMMAND {} / {}] {}", index + 1, commands.len(), command));
+        let step = index + 1;
+
+        log_incident(&format!(
+            "[COMMAND {} / {}] {}",
+            step,
+            commands.len(),
+            command
+        ));
 
         #[cfg(unix)]
         let shell = "/bin/sh";
@@ -1005,56 +1113,99 @@ fn execute_command_sequence(commands: &[String], ctx: Option<&IncidentContext>, 
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("Command {} failed to start: {}", index + 1, e))?;
+            .map_err(|e| format!("Command {} failed to start: {}", step, e))?;
 
         let start = Instant::now();
         loop {
             match child.try_wait() {
                 Ok(Some(status)) => {
-                    let stdout = child.stdout.take().map(|mut r| {
+                    let stdout = child.stdout.take().map(|mut reader| {
                         let mut buf = String::new();
-                        let _ = r.read_to_string(&mut buf);
+                        let _ = reader.read_to_string(&mut buf);
                         buf
                     }).unwrap_or_default();
-                    let stderr = child.stderr.take().map(|mut r| {
+                    let stderr = child.stderr.take().map(|mut reader| {
                         let mut buf = String::new();
-                        let _ = r.read_to_string(&mut buf);
+                        let _ = reader.read_to_string(&mut buf);
                         buf
                     }).unwrap_or_default();
 
-                    if status.success() {
-                        continue;
+                    if !status.success() {
+                        let detail = if !stderr.trim().is_empty() {
+                            format!(" stderr={}", stderr.trim())
+                        } else if !stdout.trim().is_empty() {
+                            format!(" stdout={}", stdout.trim())
+                        } else {
+                            String::new()
+                        };
+
+                        return Err(format!(
+                            "Command {} exited with status {}.{}",
+                            step, status, detail
+                        ));
                     }
 
-                    let detail = if !stderr.trim().is_empty() {
-                        format!(" stderr={}", stderr.trim())
-                    } else if !stdout.trim().is_empty() {
-                        format!(" stdout={}", stdout.trim())
-                    } else {
-                        String::new()
-                    };
-
-                    return Err(format!(
-                        "Command {} exited with status {}.{}",
-                        index + 1, status, detail
+                    log_incident(&format!(
+                        "[COMMAND {} / {}] Completed successfully",
+                        step,
+                        commands.len()
                     ));
+                    break;
                 }
                 Ok(None) if start.elapsed() >= Duration::from_secs(COMMAND_TIMEOUT_SECS) => {
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(format!(
                         "Command {} timed out after {} seconds",
-                        index + 1, COMMAND_TIMEOUT_SECS
+                        step, COMMAND_TIMEOUT_SECS
                     ));
                 }
                 Ok(None) => sleep(Duration::from_millis(100)),
                 Err(e) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
                     return Err(format!(
                         "Failed waiting for command {}: {}",
-                        index + 1, e
+                        step, e
                     ));
                 }
             }
+        }
+
+        sleep(Duration::from_secs(VERIFY_DELAY_SECS));
+
+        let verification = &verifications[index];
+        let mut verified = false;
+
+        for attempt in 1..=MAX_VERIFY_ATTEMPTS {
+            log_incident(&format!(
+                "[VERIFY COMMAND {} / {}] Verification attempt {}/{}",
+                step,
+                commands.len(),
+                attempt,
+                MAX_VERIFY_ATTEMPTS
+            ));
+
+            if verify_recovery(verification, ctx, rule) {
+                verified = true;
+                log_incident(&format!(
+                    "[VERIFY COMMAND {} / {}] Verification passed",
+                    step,
+                    commands.len()
+                ));
+                break;
+            }
+
+            if attempt < MAX_VERIFY_ATTEMPTS {
+                sleep(Duration::from_secs(VERIFY_DELAY_SECS));
+            }
+        }
+
+        if !verified {
+            return Err(format!(
+                "Command {} executed successfully but its verification failed",
+                step
+            ));
         }
     }
 
@@ -1242,8 +1393,8 @@ fn perform_remediation(remediation: &Remediation, ctx: Option<&IncidentContext>,
             let (code, stdout, stderr) = execute_command_capture(docker, &full, COMMAND_TIMEOUT_SECS)?;
             if code == 0 { Ok(()) } else { Err(format!("docker exec {} failed with code {}. stdout={} stderr={}", target, code, stdout.trim(), stderr.trim())) }
         }
-        Remediation::CommandSequence { commands } => {
-            execute_command_sequence(commands, ctx, rule)
+        Remediation::CommandSequence { commands, verifications } => {
+            execute_command_sequence(commands, verifications, ctx, rule)
         }
         Remediation::AlertOnly => Err("Alert-only rule does not perform remediation".to_string()),
     }
@@ -1380,7 +1531,7 @@ fn describe_remediation(remediation: &Remediation) -> String {
         Remediation::ContainerRestart { container } => format!("docker restart {}", container),
         Remediation::Command { executable, args } => format!("{} {}", executable, args.join(" ")),
         Remediation::ContainerExec { container, args } => format!("docker exec {} {}", container, args.join(" ")),
-        Remediation::CommandSequence { commands } => format!(
+        Remediation::CommandSequence { commands, .. } => format!(
             "{} command(s): {}",
             commands.len(),
             commands.join(" && ")
@@ -2039,14 +2190,63 @@ mod tests {
             "id":"sequence",
             "name":"sequence",
             "error_patterns":["sequence"],
-            "remediation":{"type":"command_sequence","commands":["true","true"]},
+            "remediation":{"type":"command_sequence","commands":["true","true"],"verifications":[{"type":"command_success","executable":"true"},{"type":"command_success","executable":"true"}]},
             "verification":{"type":"none"}
         }"#;
         let rule: Rule = serde_json::from_str(json).unwrap();
         match rule.remediation {
-            Remediation::CommandSequence { commands } => assert_eq!(commands.len(), 2),
+            Remediation::CommandSequence { commands, verifications } => {
+                assert_eq!(commands.len(), 2);
+                assert_eq!(verifications.len(), 2);
+            },
             _ => panic!("expected command_sequence remediation"),
         }
+    }
+
+    #[test]
+    fn command_sequence_is_limited_to_five_and_requires_verifications() {
+        let json = r#"{
+            "id":"sequence",
+            "name":"sequence",
+            "error_patterns":["sequence"],
+            "remediation":{"type":"command_sequence","commands":["true","true"],"verifications":[{"type":"command_success","executable":"true"},{"type":"command_success","executable":"true"}]},
+            "verification":{"type":"none"}
+        }"#;
+        let rule: Rule = serde_json::from_str(json).unwrap();
+        assert!(validate_rule(&rule).is_ok());
+    }
+
+    #[test]
+    fn docker_restart_must_be_last_command() {
+        assert!(command_contains_docker_restart("docker restart my-app"));
+        assert!(command_contains_docker_restart("/usr/bin/docker restart my-app"));
+        assert!(!command_contains_docker_restart("docker inspect my-app"));
+    }
+
+    #[test]
+    fn command_sequence_requires_one_real_verification_per_command() {
+        let json = r#"{
+            "id":"sequence-invalid",
+            "name":"sequence-invalid",
+            "error_patterns":["sequence"],
+            "remediation":{"type":"command_sequence","commands":["true","true"],"verifications":[{"type":"command_success","executable":"true"}]},
+            "verification":{"type":"none"}
+        }"#;
+        let rule: Rule = serde_json::from_str(json).unwrap();
+        assert!(validate_rule(&rule).is_err());
+    }
+
+    #[test]
+    fn command_sequence_rejects_docker_restart_before_final_step() {
+        let json = r#"{
+            "id":"sequence-restart-order",
+            "name":"sequence-restart-order",
+            "error_patterns":["sequence"],
+            "remediation":{"type":"command_sequence","commands":["docker restart app","true"],"verifications":[{"type":"command_success","executable":"true"},{"type":"command_success","executable":"true"}]},
+            "verification":{"type":"none"}
+        }"#;
+        let rule: Rule = serde_json::from_str(json).unwrap();
+        assert!(validate_rule(&rule).is_err());
     }
 
     #[test]
