@@ -17,22 +17,28 @@
       "my-app"
     ],
     "remediation": {
-      "type": "command",
-      "executable": "/usr/local/bin/recover-my-app",
-      "args": [
-        "my-app",
-        "{EXIT_CODE}"
-      ]
-    },
-    "verification": {
-      "type": "container_probe_success",
-      "container": "my-app",
-      "executable": "wget",
-      "args": [
-        "-q",
-        "-O",
-        "/dev/null",
-        "http://127.0.0.1:8080/health"
+      "type": "command_sequence",
+      "steps": [
+        {
+          "command": {
+            "executable": "/usr/local/bin/recover-my-app",
+            "args": [
+              "my-app",
+              "{EXIT_CODE}"
+            ]
+          },
+          "verification": {
+            "type": "container_probe_success",
+            "container": "my-app",
+            "executable": "wget",
+            "args": [
+              "-q",
+              "-O",
+              "/dev/null",
+              "http://127.0.0.1:8080/health"
+            ]
+          }
+        }
       ]
     },
     "action": "auto_recover",
@@ -63,18 +69,47 @@
       "container probe"
     ],
     "remediation": {
-      "type": "container_restart",
-      "container": "my-app"
-    },
-    "verification": {
-      "type": "container_probe_success",
-      "container": "my-app",
-      "executable": "wget",
-      "args": [
-        "-q",
-        "-O",
-        "/dev/null",
-        "http://127.0.0.1:8080/health"
+      "type": "command_sequence",
+      "steps": [
+        {
+          "command": {
+            "executable": "/usr/local/bin/recover-my-app",
+            "args": [
+              "my-app"
+            ]
+          },
+          "verification": {
+            "type": "container_probe_success",
+            "container": "my-app",
+            "executable": "wget",
+            "args": [
+              "-q",
+              "-O",
+              "/dev/null",
+              "http://127.0.0.1:8080/health"
+            ]
+          }
+        },
+        {
+          "command": {
+            "executable": "docker",
+            "args": [
+              "restart",
+              "my-app"
+            ]
+          },
+          "verification": {
+            "type": "container_probe_success",
+            "container": "my-app",
+            "executable": "wget",
+            "args": [
+              "-q",
+              "-O",
+              "/dev/null",
+              "http://127.0.0.1:8080/health"
+            ]
+          }
+        }
       ]
     },
     "action": "auto_recover",
@@ -98,13 +133,36 @@
       "HTTP"
     ],
     "remediation": {
-      "type": "container_restart",
-      "container": "my-app"
-    },
-    "verification": {
-      "type": "http_status",
-      "url": "http://127.0.0.1:8080/health",
-      "expected_status": 200
+      "type": "command_sequence",
+      "steps": [
+        {
+          "command": {
+            "executable": "/usr/local/bin/recover-my-app",
+            "args": [
+              "my-app"
+            ]
+          },
+          "verification": {
+            "type": "http_status",
+            "url": "http://127.0.0.1:8080/health",
+            "expected_status": 200
+          }
+        },
+        {
+          "command": {
+            "executable": "docker",
+            "args": [
+              "restart",
+              "my-app"
+            ]
+          },
+          "verification": {
+            "type": "http_status",
+            "url": "http://127.0.0.1:8080/health",
+            "expected_status": 200
+          }
+        }
+      ]
     },
     "action": "auto_recover",
     "priority": 35
