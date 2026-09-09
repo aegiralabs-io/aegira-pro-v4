@@ -1526,16 +1526,23 @@ fn recover_with_rule(
 }
 
 fn make_incident_key(rule: &Rule, ctx: &IncidentContext) -> String {
+    // Cooldowns must use stable identity, never transient Docker logs or HTTP
+    // error text. Otherwise every changed log line becomes a new incident.
     format!(
-        "{}:{}:{}:{}:{}",
+        "{}:{}:{}:{}",
         rule.id.to_lowercase(),
         ctx.source,
         ctx.container.as_deref().unwrap_or(""),
-        ctx.exit_code.map(|v| v.to_string()).unwrap_or_default(),
-        // For HTTP incidents the URL is already part of the rule, so do not
-        // include the transient error text. For log incidents the text remains
-        // useful for distinguishing unrelated failures.
-        if ctx.source == "http_health" { String::new() } else { ctx.incident.to_lowercase() }
+        ctx.exit_code.map(|v| v.to_string()).unwrap_or_default()
+    )
+}
+
+fn make_unknown_incident_key(ctx: &IncidentContext) -> String {
+    format!(
+        "unknown:{}:{}:{}",
+        ctx.source,
+        ctx.container.as_deref().unwrap_or(""),
+        ctx.exit_code.map(|v| v.to_string()).unwrap_or_default()
     )
 }
 
@@ -1575,7 +1582,12 @@ fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashM
     let (rule, score) = match find_best_rule_for_context(rules, ctx) {
         Some(v) => v,
         None => {
-            log_incident(&format!("[MATCH] No known rule for source '{}'", ctx.source));
+            let key = make_unknown_incident_key(ctx);
+            if cooldowns.contains_key(&key) {
+                return;
+            }
+            cooldowns.insert(key, Instant::now());
+            log_incident(&format!("[MATCH] No known rule for source '{}' container='{}' exit={:?}", ctx.source, ctx.container.as_deref().unwrap_or(""), ctx.exit_code));
             send_alert("Aegira: Unknown Incident Detected", &alert_body(&ctx.incident, None, "UNKNOWN - MANUAL INVESTIGATION REQUIRED"));
             return;
         }
@@ -1671,7 +1683,9 @@ fn run_docker_event_monitor() {
     let mut rules = load_all_rules();
     let mut fingerprint = get_rule_fingerprint();
     let mut cooldowns = HashMap::new();
+    let mut seen_events: HashMap<String, Instant> = HashMap::new();
     loop {
+        seen_events.retain(|_, timestamp| timestamp.elapsed() < Duration::from_secs(INCIDENT_COOLDOWN_SECS));
         let docker = match docker_binary() { Ok(v)=>v, Err(e)=>{log_incident(&format!("[DOCKER] {}",e)); sleep(Duration::from_secs(DOCKER_EVENT_RECONNECT_SECS)); continue;} };
         log_incident("[DOCKER] Starting Docker event monitor");
         let mut child = match Command::new(docker).args(["events", "--filter", "type=container", "--format", "{{json .}}"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
@@ -1683,6 +1697,10 @@ fn run_docker_event_monitor() {
                 let current = get_rule_fingerprint();
                 if current != fingerprint { let nr=load_all_rules(); if !nr.is_empty(){rules=nr; fingerprint=current;} }
                 let Some((status,id,exit_code,name))=parse_docker_event_line(&line) else { continue };
+                seen_events.retain(|_, timestamp| timestamp.elapsed() < Duration::from_secs(INCIDENT_COOLDOWN_SECS));
+                let event_key = format!("{}:{}:{}", id, status, exit_code.map(|v| v.to_string()).unwrap_or_default());
+                if seen_events.contains_key(&event_key) { continue; }
+                seen_events.insert(event_key, Instant::now());
                 let container=name.unwrap_or_else(|| container_display_name(&id));
                 match status.as_str() {
                     "die" => {
