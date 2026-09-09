@@ -1,127 +1,12 @@
 [
   {
-    "id": "my_app_exit_42",
-    "name": "My App Exit Code 42",
-    "severity": "high",
-    "trigger": {
-      "type": "docker_exit",
-      "container": "my-app",
-      "exit_codes": [42]
-    },
-    "error_patterns": [
-      "exited",
-      "exit code 42"
-    ],
-    "context_patterns": [
-      "docker container",
-      "my-app"
-    ],
-    "remediation": {
-      "type": "command_sequence",
-      "steps": [
-        {
-          "command": {
-            "executable": "/usr/local/bin/recover-my-app",
-            "args": [
-              "my-app",
-              "{EXIT_CODE}"
-            ]
-          },
-          "verification": {
-            "type": "container_probe_success",
-            "container": "my-app",
-            "executable": "wget",
-            "args": [
-              "-q",
-              "-O",
-              "/dev/null",
-              "http://127.0.0.1:8080/health"
-            ]
-          }
-        }
-      ]
-    },
-    "action": "auto_recover",
-    "priority": 30
-  },
-  {
-    "id": "internal_api_probe",
-    "name": "Internal API Probe",
-    "severity": "critical",
-    "trigger": {
-      "type": "container_probe",
-      "container": "my-app",
-      "executable": "wget",
-      "args": [
-        "-q",
-        "-O",
-        "/dev/null",
-        "http://127.0.0.1:8080/health"
-      ],
-      "interval_secs": 5
-    },
-    "error_patterns": [
-      "probe",
-      "failed"
-    ],
-    "context_patterns": [
-      "my-app",
-      "container probe"
-    ],
-    "remediation": {
-      "type": "command_sequence",
-      "steps": [
-        {
-          "command": {
-            "executable": "/usr/local/bin/recover-my-app",
-            "args": [
-              "my-app"
-            ]
-          },
-          "verification": {
-            "type": "container_probe_success",
-            "container": "my-app",
-            "executable": "wget",
-            "args": [
-              "-q",
-              "-O",
-              "/dev/null",
-              "http://127.0.0.1:8080/health"
-            ]
-          }
-        },
-        {
-          "command": {
-            "executable": "docker",
-            "args": [
-              "restart",
-              "my-app"
-            ]
-          },
-          "verification": {
-            "type": "container_probe_success",
-            "container": "my-app",
-            "executable": "wget",
-            "args": [
-              "-q",
-              "-O",
-              "/dev/null",
-              "http://127.0.0.1:8080/health"
-            ]
-          }
-        }
-      ]
-    },
-    "action": "auto_recover",
-    "priority": 35
-  },
-  {
-    "id": "public_api_health",
-    "name": "Public API Health",
+    "id": "api_dead_e2e_test",
+    "name": "API Dead In-Container Recovery E2E Test",
     "severity": "critical",
     "trigger": {
       "type": "http_health",
-      "url": "http://127.0.0.1:8080/health",
+      "container": "aegira-api-e2e",
+      "url": "http://127.0.0.1:18080/health",
       "expected_status": 200,
       "interval_secs": 5
     },
@@ -129,42 +14,67 @@
       "HTTP health check failed"
     ],
     "context_patterns": [
-      "health check",
-      "HTTP"
+      "aegira-api-e2e",
+      "127.0.0.1:18080/health"
+    ],
+    "remediation": {
+      "type": "container_restart",
+      "container": "aegira-api-e2e"
+    },
+    "verification": {
+      "type": "container_http_status",
+      "container": "aegira-api-e2e",
+      "url": "http://127.0.0.1:18080/health",
+      "expected_status": 200
+    },
+    "action": "auto_recover",
+    "priority": 20
+  },
+  {
+    "id": "docker_exit_137_e2e_test",
+    "name": "Docker Exit 137 Full E2E Recovery Test",
+    "severity": "critical",
+    "trigger": {
+      "type": "docker_exit",
+      "container": "aegira-e2e",
+      "exit_codes": [137]
+    },
+    "error_patterns": [
+      "Docker container 'aegira-e2e' exited",
+      "exit code 137"
+    ],
+    "context_patterns": [
+      "aegira-e2e"
     ],
     "remediation": {
       "type": "command_sequence",
-      "steps": [
+      "commands": [
+        "echo E2E_137_COMMAND_1 > /tmp/aegira-137-command-1",
+        "test -f /tmp/aegira-137-command-1 && echo E2E_137_COMMAND_2 > /tmp/aegira-137-command-2",
+        "docker restart aegira-e2e"
+      ],
+      "verifications": [
         {
-          "command": {
-            "executable": "/usr/local/bin/recover-my-app",
-            "args": [
-              "my-app"
-            ]
-          },
-          "verification": {
-            "type": "http_status",
-            "url": "http://127.0.0.1:8080/health",
-            "expected_status": 200
-          }
+          "type": "command_success",
+          "executable": "test",
+          "args": ["-f", "/tmp/aegira-137-command-1"]
         },
         {
-          "command": {
-            "executable": "docker",
-            "args": [
-              "restart",
-              "my-app"
-            ]
-          },
-          "verification": {
-            "type": "http_status",
-            "url": "http://127.0.0.1:8080/health",
-            "expected_status": 200
-          }
+          "type": "command_success",
+          "executable": "test",
+          "args": ["-f", "/tmp/aegira-137-command-2"]
+        },
+        {
+          "type": "container_running",
+          "container": "aegira-e2e"
         }
       ]
     },
+    "verification": {
+      "type": "container_running",
+      "container": "aegira-e2e"
+    },
     "action": "auto_recover",
-    "priority": 35
+    "priority": 20
   }
 ]
