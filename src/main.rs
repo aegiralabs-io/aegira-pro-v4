@@ -1,8 +1,8 @@
 use reqwest::blocking::Client;
+use reqwest::Url;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -28,8 +28,6 @@ const DOCKER_EVENT_RECONNECT_SECS: u64 = 3;
 const DOCKER_LOG_TAIL_LINES: u32 = 80;
 const API_HEALTH_POLL_SECS: u64 = 5;
 const MAX_COMMAND_SEQUENCE_LENGTH: usize = 5;
-const MAX_RECOVERY_ATTEMPTS: u32 = 3;
-const RECOVERY_WINDOW_SECS: u64 = 300;
 
 const MIN_MATCH_SCORE: i32 = 60;
 const SELF_SERVICE: &str = "aegira";
@@ -137,10 +135,6 @@ fn get_rule_fingerprint() -> RuleFileFingerprint {
             }
         }
     }
-    if let Ok(metadata) = fs::metadata(CONFIG_PATH) {
-        let modified = metadata.modified().ok().and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs().saturating_mul(1_000_000_000)+d.subsec_nanos() as u64).unwrap_or(0);
-        files.push((CONFIG_PATH.to_string(), metadata.len(), modified));
-    }
     files.sort();
     RuleFileFingerprint { files }
 }
@@ -148,19 +142,6 @@ fn get_rule_fingerprint() -> RuleFileFingerprint {
 fn default_rule_action() -> String {
     "auto_recover".to_string()
 }
-
-#[derive(Debug, Deserialize, Clone)]
-struct RecoveryStep {
-    remediation: Remediation,
-    verification: Verification,
-    #[serde(default = "default_recovery_attempts")]
-    max_attempts: u32,
-    #[serde(default = "default_recovery_delay")]
-    delay_secs: u64,
-}
-
-fn default_recovery_attempts() -> u32 { 5 }
-fn default_recovery_delay() -> u64 { VERIFY_DELAY_SECS }
 
 #[derive(Debug, Deserialize, Clone)]
 struct Rule {
@@ -187,9 +168,6 @@ struct Rule {
 
     #[serde(default)]
     priority: i32,
-
-    #[serde(default)]
-    escalation: Vec<RecoveryStep>,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -211,6 +189,10 @@ enum Trigger {
     },
     HttpHealth {
         url: String,
+        /// Explicit Docker container owning this HTTP endpoint.
+        /// Rules should always set this for automatic recovery.
+        #[serde(default)]
+        container: Option<String>,
         #[serde(default = "default_expected_status")]
         expected_status: u16,
         #[serde(default = "default_api_interval")]
@@ -281,6 +263,14 @@ enum Verification {
 
     #[serde(rename = "http_status")]
     HttpStatus { url: String, #[serde(default = "default_expected_status")] expected_status: u16 },
+
+    #[serde(rename = "container_http_status")]
+    ContainerHttpStatus {
+        container: String,
+        url: String,
+        #[serde(default = "default_expected_status")]
+        expected_status: u16,
+    },
 
     #[serde(rename = "command_success")]
     CommandSuccess { executable: String, #[serde(default)] args: Vec<String> },
@@ -469,6 +459,15 @@ fn validate_verification(verification: &Verification, rule_id: &str, allow_none:
                 return Err(format!("Rule '{}' has invalid HTTP verification status", rule_id));
             }
         }
+        Verification::ContainerHttpStatus { container, url, expected_status } => {
+            validate_target_name(container, "Verification HTTP container")?;
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(format!("Rule '{}' container HTTP verification URL must start with http:// or https://", rule_id));
+            }
+            if *expected_status == 0 {
+                return Err(format!("Rule '{}' has invalid container HTTP verification status", rule_id));
+            }
+        }
         Verification::CommandSuccess { executable, args } => {
             if executable.trim().is_empty() || executable.len() > 512 || args.len() > 64 || args.iter().any(|a| a.len() > 4096) {
                 return Err(format!("Rule '{}' has invalid command verification", rule_id));
@@ -571,6 +570,15 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
             for verification in verifications {
                 validate_verification(verification, &rule.id, false)?;
             }
+
+            for (index, command) in commands.iter().enumerate() {
+                if command_contains_docker_restart(command) && index != commands.len() - 1 {
+                    return Err(format!(
+                        "Rule '{}' docker restart must be the final command in a command_sequence",
+                        rule.id
+                    ));
+                }
+            }
         }
         Remediation::AlertOnly => {}
     }
@@ -589,9 +597,11 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
             if status.trim().is_empty() { return Err(format!("Rule '{}' has empty Docker health status", rule.id)); }
         }
         Trigger::DockerOom { container } => validate_target_name(container, "Docker OOM container")?,
-        Trigger::HttpHealth { url, expected_status, interval_secs } => {
+        Trigger::HttpHealth { url, container, expected_status, interval_secs } => {
             if !url.starts_with("http://") && !url.starts_with("https://") { return Err(format!("Rule '{}' HTTP trigger URL must start with http:// or https://", rule.id)); }
             if *expected_status == 0 || *interval_secs == 0 { return Err(format!("Rule '{}' has invalid HTTP trigger settings", rule.id)); }
+            let container = container.as_deref().ok_or_else(|| format!("Rule '{}' HTTP health trigger requires an explicit container", rule.id))?;
+            validate_target_name(container, "HTTP health container")?;
         }
         Trigger::ContainerProbe { container, executable, args, interval_secs } => {
             validate_target_name(container, "Container probe container")?;
@@ -679,7 +689,7 @@ fn load_rules_from_directory(
 
                 Err(e) => {
                     log_incident(&format!(
-                        "[RULES ERROR] Invalid JSON {}: {}",
+                        "[RULES] Skipped invalid JSON {}: {}",
                         file_path.display(),
                         e
                     ));
@@ -691,17 +701,12 @@ fn load_rules_from_directory(
         for rule in parsed {
             match validate_rule(&rule) {
                 Ok(()) => {
-                    log_incident(&format!(
-                        "[RULES] Loaded: {}",
-                        rule.id
-                    ));
-
                     rules.push(rule);
                 }
 
                 Err(e) => {
                     log_incident(&format!(
-                        "[RULES ERROR] {}",
+                        "[RULES] Skipped invalid rule: {}",
                         e
                     ));
                 }
@@ -735,7 +740,6 @@ fn get_hardcoded_default_rules() -> Vec<Rule> {
 
         action: "auto_recover".to_string(),
         priority: 10,
-        escalation: vec![],
     }]
 }
 
@@ -767,7 +771,6 @@ fn load_all_rules() -> Vec<Rule> {
         let id = rule.id.trim().to_lowercase();
         if let Some(index) = rules.iter().position(|existing| existing.id.trim().eq_ignore_ascii_case(&id)) {
             rules[index] = rule.clone();
-            log_incident(&format!("[RULES] Custom rule overrides builtin: {}", rule.id));
         } else if seen_ids.insert(id) {
             rules.push(rule);
         }
@@ -874,7 +877,12 @@ fn trigger_matches(rule: &Rule, ctx: &IncidentContext) -> bool {
             let target = match resolve_trigger_container(container) { Ok(v) => v, Err(_) => return false };
             ctx.container.as_deref() == Some(target.as_str()) || ctx.container.as_deref() == Some(container.as_str())
         }
-        Trigger::HttpHealth { url, .. } => ctx.source == "http_health" && ctx.incident.contains(url),
+        Trigger::HttpHealth { url, container, .. } => {
+            if ctx.source != "http_health" || !ctx.incident.contains(url) { return false; }
+            let Some(container) = container.as_deref() else { return false; };
+            let target = match resolve_trigger_container(container) { Ok(v) => v, Err(_) => return false };
+            ctx.container.as_deref() == Some(target.as_str()) || ctx.container.as_deref() == Some(container)
+        },
         Trigger::ContainerProbe { container, executable, .. } => {
             if ctx.source != "container_probe" { return false; }
             let target = match resolve_trigger_container(container) { Ok(v) => v, Err(_) => return false };
@@ -1043,27 +1051,21 @@ fn execute_command_capture(executable: &str, args: &[String], timeout_secs: u64)
     log_incident(&format!("[EXEC] {} {}", executable, args.join(" ")));
     let mut child = Command::new(executable)
         .args(args)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .spawn()
         .map_err(|e| format!("Failed to start {}: {}", executable, e))?;
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let stdout = child.stdout.take().map(|mut r| { let mut b=String::new(); let _=r.read_to_string(&mut b); b }).unwrap_or_default();
-                let stderr = child.stderr.take().map(|mut r| { let mut b=String::new(); let _=r.read_to_string(&mut b); b }).unwrap_or_default();
-                return Ok((status.code().unwrap_or(-1), stdout, stderr));
-            }
+            Ok(Some(status)) => return Ok((status.code().unwrap_or(-1), String::new(), String::new())),
             Ok(None) if start.elapsed() >= Duration::from_secs(timeout_secs) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                let stdout = child.stdout.take().map(|mut r| { let mut b=String::new(); let _=r.read_to_string(&mut b); b }).unwrap_or_default();
-                let stderr = child.stderr.take().map(|mut r| { let mut b=String::new(); let _=r.read_to_string(&mut b); b }).unwrap_or_default();
-                return Err(format!("{} timed out after {} seconds. stdout={} stderr={}", executable, timeout_secs, stdout.trim(), stderr.trim()));
+                return Err(format!("{} timed out after {} seconds", executable, timeout_secs));
             }
             Ok(None) => sleep(Duration::from_millis(100)),
-            Err(e) => { let _=child.kill(); let _=child.wait(); return Err(format!("Failed waiting for {}: {}", executable, e)); }
+            Err(e) => return Err(format!("Failed waiting for {}: {}", executable, e)),
         }
     }
 }
@@ -1095,6 +1097,12 @@ fn execute_command_sequence(
 
     if verifications.iter().any(|v| matches!(v, Verification::None)) {
         return Err("Command sequence requires a real verification after every command".to_string());
+    }
+
+    for (index, command) in commands.iter().enumerate() {
+        if command_contains_docker_restart(command) && index != commands.len() - 1 {
+            return Err("docker restart must be the final command in a command_sequence".to_string());
+        }
     }
 
     log_incident(&format!(
@@ -1201,9 +1209,7 @@ fn execute_command_sequence(
                 MAX_VERIFY_ATTEMPTS
             ));
 
-            let verification_result = verify_recovery(verification, ctx, rule);
-            log_incident(&format!("[VERIFY] {}: {} ({:.2?})", if verification_result.passed { "SUCCESS" } else { "FAILED" }, verification_result.message, verification_result.duration));
-            if verification_result.passed {
+            if verify_recovery(verification, ctx, rule) {
                 verified = true;
                 log_incident(&format!(
                     "[VERIFY COMMAND {} / {}] Verification passed",
@@ -1417,120 +1423,120 @@ fn perform_remediation(remediation: &Remediation, ctx: Option<&IncidentContext>,
     }
 }
 
-#[derive(Debug)]
-struct VerificationResult {
-    passed: bool,
-    message: String,
-    duration: Duration,
-}
-
-fn verify_recovery(verification: &Verification, ctx: Option<&IncidentContext>, rule: &Rule) -> VerificationResult {
-    let started = Instant::now();
-    let result = match verification {
-        Verification::None => (true, "no verification required".to_string()),
-        Verification::ServiceActive { service } => match resolve_service_target(service) {
-            Ok(target) => match systemctl_binary() {
-                Ok(systemctl) => match Command::new(systemctl).args(["is-active", target.as_str()]).output() {
-                    Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "active" => (true, format!("service {} is active", target)),
-                    Ok(o) => (false, format!("service {} is inactive: {}", target, String::from_utf8_lossy(&o.stderr).trim())),
-                    Err(e) => (false, format!("systemctl error: {}", e)),
-                },
-                Err(e) => (false, e),
-            },
-            Err(e) => (false, e),
-        },
-        Verification::ContainerRunning { container } => match resolve_container_target(container) {
-            Ok(target) => match docker_binary() {
-                Ok(docker) => match Command::new(docker).args(["inspect", "-f", "{{.State.Running}}", target.as_str()]).output() {
-                    Ok(o) if o.status.success() && String::from_utf8_lossy(&o.stdout).trim() == "true" => (true, format!("container {} is running", target)),
-                    Ok(o) => (false, format!("container {} is not running: {}", target, String::from_utf8_lossy(&o.stderr).trim())),
-                    Err(e) => (false, format!("docker inspect error: {}", e)),
-                },
-                Err(e) => (false, e),
-            },
-            Err(e) => (false, e),
-        },
-        Verification::ContainerHealthy { container } => match resolve_container_target(container) {
-            Ok(target) => match docker_binary() {
-                Ok(docker) => match Command::new(docker).args(["inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", target.as_str()]).output() {
-                    Ok(o) if o.status.success() => match String::from_utf8_lossy(&o.stdout).trim() {
-                        "healthy" => (true, format!("container {} health is healthy", target)),
-                        "none" => (false, format!("container {} has no configured healthcheck", target)),
-                        status => (false, format!("Docker health status is {}", status)),
-                    },
-                    Ok(o) => (false, format!("Docker inspect failed: {}", String::from_utf8_lossy(&o.stderr).trim())),
-                    Err(e) => (false, format!("docker inspect error: {}", e)),
-                },
-                Err(e) => (false, e),
-            },
-            Err(e) => (false, e),
-        },
-        Verification::ContainerProbeSuccess { container, executable, args } => match resolve_container_target(container) {
-            Ok(target) => match docker_binary() {
-                Ok(docker) => { let mut full=vec!["exec".to_string(),target.clone(),executable.clone()]; full.extend(args.iter().cloned()); match execute_command_capture(docker,&full,COMMAND_TIMEOUT_SECS) { Ok((0,_,_))=>(true,"probe exited with code 0".to_string()), Ok((code,_,stderr))=>(false,format!("probe exited with code {} stderr={}",code,stderr.trim())), Err(e)=>(false,e) } },
-                Err(e) => (false,e),
-            },
-            Err(e) => (false,e),
-        },
+fn verify_recovery(verification: &Verification, ctx: Option<&IncidentContext>, rule: &Rule) -> bool {
+    match verification {
+        Verification::None => { log_incident("[VERIFY] No verification required"); true }
+        Verification::ServiceActive { service } => {
+            let target = match resolve_service_target(service) { Ok(v)=>v, Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); return false;} };
+            let systemctl = match systemctl_binary() { Ok(v)=>v, Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); return false;} };
+            match Command::new(systemctl).args(["is-active", target.as_str()]).output() { Ok(o)=>o.status.success() && String::from_utf8_lossy(&o.stdout).trim()=="active", Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); false} }
+        }
+        Verification::ContainerRunning { container } => {
+            let target = match resolve_container_target(container) { Ok(v)=>v, Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); return false;} };
+            let docker = match docker_binary() { Ok(v)=>v, Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); return false;} };
+            match Command::new(docker).args(["inspect", "-f", "{{.State.Running}}", target.as_str()]).output() { Ok(o)=>o.status.success() && String::from_utf8_lossy(&o.stdout).trim()=="true", Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); false} }
+        }
+        Verification::ContainerHealthy { container } => {
+            let target = match resolve_container_target(container) { Ok(v)=>v, Err(_)=>return false };
+            let docker = match docker_binary() { Ok(v)=>v, Err(_)=>return false };
+            match Command::new(docker).args(["inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", target.as_str()]).output() {
+                Ok(o)=>o.status.success() && String::from_utf8_lossy(&o.stdout).trim().eq_ignore_ascii_case("healthy"),
+                Err(_)=>false,
+            }
+        }
+        Verification::ContainerProbeSuccess { container, executable, args } => {
+            let target = match resolve_container_target(container) { Ok(v)=>v, Err(_)=>return false };
+            let docker = match docker_binary() { Ok(v)=>v, Err(_)=>return false };
+            let mut full = vec!["exec".to_string(), target, executable.clone()];
+            full.extend(args.iter().cloned());
+            match execute_command_capture(docker, &full, COMMAND_TIMEOUT_SECS) { Ok((code,_,_))=>code==0, Err(_)=>false }
+        }
         Verification::HttpStatus { url, expected_status } => {
-            let client = match Client::builder().timeout(Duration::from_secs(COMPOSIO_TIMEOUT_SECS)).build() { Ok(v)=>v, Err(e)=>(return VerificationResult{passed:false,message:format!("failed to create HTTP client: {}",e),duration:started.elapsed()}) };
-            match client.get(url).send() { Ok(r) if r.status().as_u16()==*expected_status => (true,format!("HTTP status {}",r.status())), Ok(r)=>(false,format!("HTTP status {}, expected {}",r.status(),expected_status)), Err(e) => { let m=e.to_string(); if m.to_lowercase().contains("timed out") {(false,format!("request timed out after {}s",COMPOSIO_TIMEOUT_SECS))} else {(false,format!("request failed: {}",m))} } }
+            let client = match Client::builder().timeout(Duration::from_secs(COMPOSIO_TIMEOUT_SECS)).build() { Ok(v)=>v, Err(_)=>return false };
+            match client.get(url).send() { Ok(r)=>r.status().as_u16()==*expected_status, Err(_)=>false }
+        }
+        Verification::ContainerHttpStatus { container, url, expected_status } => {
+            verify_container_http_status(container, url, *expected_status)
         }
         Verification::CommandSuccess { executable, args } => {
             let expanded: Vec<String> = args.iter().map(|a| expand_command_arg(a, ctx, rule)).collect();
-            match execute_command_capture(executable,&expanded,COMMAND_TIMEOUT_SECS) { Ok((0,out,_))=>(true,format!("command exited with code 0 stdout={}",out.trim())), Ok((code,out,err))=>(false,format!("command exited with code {} stdout={} stderr={}",code,out.trim(),err.trim())), Err(e)=>(false,e) }
+            match execute_command_capture(executable, &expanded, COMMAND_TIMEOUT_SECS) { Ok((code,_,_))=>code==0, Err(_)=>false }
         }
-    };
-    VerificationResult { passed: result.0, message: result.1, duration: started.elapsed() }
+    }
 }
 
-fn execute_recovery_step(step: &RecoveryStep, ctx: &IncidentContext, rule: &Rule) -> Result<(), String> {
-    log_incident("[RECOVERY] Executing configured recovery step");
-    perform_remediation(&step.remediation, Some(ctx), rule)
-        .map_err(|e| format!("Remediation execution failed: {}", e))?;
-    sleep(Duration::from_secs(step.delay_secs));
-    let attempts = step.max_attempts.max(1);
-    for attempt in 1..=attempts {
-        let vr = verify_recovery(&step.verification, Some(ctx), rule);
-        log_incident(&format!("[VERIFY] Attempt {}/{}: {}: {}", attempt, attempts, if vr.passed {"SUCCESS"} else {"FAILED"}, vr.message));
-        if vr.passed { return Ok(()); }
-        if attempt < attempts { sleep(Duration::from_secs(step.delay_secs)); }
+fn recover_with_rule(
+    rule: &Rule,
+    ctx: &IncidentContext,
+) -> Result<(), String> {
+    log_incident(&format!(
+        "[MATCH] Rule: {}",
+        rule.name
+    ));
+
+    log_incident(&format!(
+        "[MATCH] Rule ID: {}",
+        rule.id
+    ));
+
+    if matches!(rule.remediation, Remediation::AlertOnly) {
+        return Err("Alert-only rule does not perform remediation".to_string());
     }
-    Err("Remediation executed but verification failed".to_string())
-}
 
-fn recover_with_rule(rule: &Rule, ctx: &IncidentContext) -> Result<(), String> {
-    log_incident(&format!("[MATCH] Rule: {}", rule.name));
-    log_incident(&format!("[MATCH] Rule ID: {}", rule.id));
-    if matches!(rule.remediation, Remediation::AlertOnly) { return Err("Alert-only rule does not perform remediation".to_string()); }
-    if !remediation_allowed() { return Err("Pro license is not active".to_string()); }
+    if !remediation_allowed() {
+        return Err("Pro license is not active".to_string());
+    }
 
-    let primary = RecoveryStep { remediation: rule.remediation.clone(), verification: rule.verification.clone(), max_attempts: MAX_VERIFY_ATTEMPTS, delay_secs: VERIFY_DELAY_SECS };
-    log_incident("[RECOVERY] Primary remediation starting");
-    match execute_recovery_step(&primary, ctx, rule) {
-        Ok(()) => { log_incident("[SUCCESS] Recovery verified"); return Ok(()); }
-        Err(primary_error) => {
-            log_incident(&format!("[ESCALATION] Primary remediation failed: {}", primary_error));
-            if rule.escalation.is_empty() { return Err(primary_error); }
+    perform_remediation(
+        &rule.remediation,
+        Some(ctx),
+        rule,
+    )?;
+
+    sleep(Duration::from_secs(
+        VERIFY_DELAY_SECS,
+    ));
+
+    for attempt in 1..=MAX_VERIFY_ATTEMPTS {
+        log_incident(&format!(
+            "[VERIFY] Verification attempt {}/{}",
+            attempt,
+            MAX_VERIFY_ATTEMPTS
+        ));
+
+        if verify_recovery(
+            &rule.verification,
+            Some(ctx),
+            rule,
+        ) {
+            return Ok(());
+        }
+
+        if attempt < MAX_VERIFY_ATTEMPTS {
+            sleep(Duration::from_secs(
+                VERIFY_DELAY_SECS,
+            ));
         }
     }
 
-    for (index, step) in rule.escalation.iter().enumerate() {
-        log_incident(&format!("[ESCALATION] Executing step {}/{}", index + 1, rule.escalation.len()));
-        match execute_recovery_step(step, ctx, rule) {
-            Ok(()) => {
-                let final_check = verify_recovery(&rule.verification, Some(ctx), rule);
-                log_incident(&format!("[VERIFY] Final health check: {}: {}", if final_check.passed {"SUCCESS"} else {"FAILED"}, final_check.message));
-                if final_check.passed { log_incident("[SUCCESS] Recovery completed after escalation"); return Ok(()); }
-            }
-            Err(e) => log_incident(&format!("[ESCALATION] Step {} failed: {}", index + 1, e)),
-        }
-    }
-    Err("All configured recovery steps exhausted".to_string())
+    Err(
+        "Remediation executed but health verification failed"
+            .to_string(),
+    )
 }
 
 fn make_incident_key(rule: &Rule, ctx: &IncidentContext) -> String {
-    format!("{}:{}:{}", rule.id.trim().to_lowercase(), ctx.source, ctx.container.as_deref().unwrap_or("-"))
+    format!(
+        "{}:{}:{}:{}:{}",
+        rule.id.to_lowercase(),
+        ctx.source,
+        ctx.container.as_deref().unwrap_or(""),
+        ctx.exit_code.map(|v| v.to_string()).unwrap_or_default(),
+        // For HTTP incidents the URL is already part of the rule, so do not
+        // include the transient error text. For log incidents the text remains
+        // useful for distinguishing unrelated failures.
+        if ctx.source == "http_health" { String::new() } else { ctx.incident.to_lowercase() }
+    )
 }
 
 fn cleanup_cooldowns(
@@ -1563,13 +1569,9 @@ fn describe_remediation(remediation: &Remediation) -> String {
     }
 }
 
-#[derive(Debug)]
-struct RecoveryState { attempts: u32, window_started: Instant, last_attempt: Instant, last_failure: Option<String> }
-
-fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashMap<String, Instant>, recovery_states: &mut HashMap<String, RecoveryState>) {
+fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashMap<String, Instant>) {
     cleanup_cooldowns(cooldowns);
     let start = Instant::now();
-    log_incident(&format!("[WATCHER] Incident detected: {}", ctx.incident));
     let (rule, score) = match find_best_rule_for_context(rules, ctx) {
         Some(v) => v,
         None => {
@@ -1579,8 +1581,9 @@ fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashM
         }
     };
     let key = make_incident_key(rule, ctx);
-    if cooldowns.contains_key(&key) { log_incident(&format!("[COOLDOWN] Duplicate incident skipped for rule '{}'", rule.id)); return; }
+    if cooldowns.contains_key(&key) { return; }
     cooldowns.insert(key, Instant::now());
+    log_incident(&format!("[WATCHER] Incident detected: {}", ctx.incident));
     log_incident(&format!("[MATCH] Rule: {}", rule.name));
     log_incident(&format!("[MATCH] Confidence score: {}", score));
     let action = rule.action.trim().to_lowercase();
@@ -1599,23 +1602,13 @@ fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashM
         send_alert(&format!("Aegira: {}", rule.name), &alert_body(&ctx.incident, Some(rule), "ALERT ONLY"));
         return;
     }
-    let recovery_key = make_incident_key(rule, ctx);
-    let now = Instant::now();
-    let state = recovery_states.entry(recovery_key.clone()).or_insert_with(|| RecoveryState { attempts: 0, window_started: now, last_attempt: now - Duration::from_secs(INCIDENT_COOLDOWN_SECS), last_failure: None });
-    if state.window_started.elapsed() > Duration::from_secs(RECOVERY_WINDOW_SECS) { state.attempts = 0; state.window_started = now; state.last_failure = None; }
-    if state.last_attempt.elapsed() < Duration::from_secs(INCIDENT_COOLDOWN_SECS) { log_incident("[BLOCKED] Recovery blocked by cooldown"); send_alert(&format!("Aegira: {} recovery blocked", rule.name), &alert_body(&ctx.incident, Some(rule), "RECOVERY BLOCKED - COOLDOWN")); return; }
-    if state.attempts >= MAX_RECOVERY_ATTEMPTS { log_incident("[BLOCKED] Recovery blocked by maximum attempts"); send_alert(&format!("Aegira: {} recovery blocked", rule.name), &alert_body(&ctx.incident, Some(rule), "RECOVERY BLOCKED - MAXIMUM ATTEMPTS")); return; }
-    state.attempts += 1; state.last_attempt = now;
-    log_incident(&format!("[RECOVERY] Attempt {}/{} allowed", state.attempts, MAX_RECOVERY_ATTEMPTS));
     match recover_with_rule(rule, ctx) {
         Ok(()) => {
-            recovery_states.remove(&recovery_key);
-            log_incident(&format!("[SUCCESS] Incident automatically recovered in {:.2?}", start.elapsed()));
+            log_incident(&format!("[RESOLVED] Incident automatically recovered in {:.2?}", start.elapsed()));
             if load_config().map(|c| c.alerts.notify_on_recovery).unwrap_or(false) { send_alert(&format!("Aegira: {} recovered", rule.name), &alert_body(&ctx.incident, Some(rule), "RECOVERED")); }
         }
         Err(e) => {
-            if let Some(state) = recovery_states.get_mut(&recovery_key) { state.last_failure = Some(e.clone()); }
-            log_incident(&format!("[FAILED] {}", e));
+            log_incident(&format!("[RECOVERY FAILED] {}", e));
             log_incident(&format!("[MANUAL ACTION] Rule '{}' requires intervention", rule.id));
             send_alert(&format!("Aegira: {} recovery failed", rule.name), &alert_body(&ctx.incident, Some(rule), "RECOVERY FAILED - MANUAL ACTION REQUIRED"));
         }
@@ -1665,18 +1658,16 @@ fn get_file_identity(
 }
 
 fn parse_docker_event_line(line: &str) -> Option<(String, String, Option<i32>, Option<String>)> {
-    let value: serde_json::Value = match serde_json::from_str(line) { Ok(v) => v, Err(e) => { log_incident(&format!("[DOCKER ERROR] Invalid event JSON: {}", e)); return None; } };
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
     let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("").to_string();
     let id = value.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-    if id.is_empty() { log_incident("[DOCKER ERROR] Event missing container ID"); return None; }
     let attrs = value.get("Actor").and_then(|v| v.get("Attributes"));
     let name = attrs.and_then(|v| v.get("name")).and_then(|v| v.as_str()).map(|s| s.to_string());
-    let exit_code = attrs.and_then(|v| v.get("exitCode")).and_then(|v| if let Some(s)=v.as_str(){s.parse::<i32>().ok()} else {v.as_i64().and_then(|n| i32::try_from(n).ok())});
-    if attrs.and_then(|a| a.get("exitCode")).is_some() && exit_code.is_none() { log_incident("[DOCKER ERROR] Invalid exitCode value in Docker event"); }
-    Some((status, id, exit_code, name))
+    let exit_code = attrs.and_then(|v| v.get("exitCode")).and_then(|v| v.as_str()).and_then(|s| s.parse::<i32>().ok());
+    if id.is_empty() { None } else { Some((status, id, exit_code, name)) }
 }
 
-fn run_docker_event_monitor(recovery_states: Arc<Mutex<HashMap<String, RecoveryState>>>) {
+fn run_docker_event_monitor() {
     let mut rules = load_all_rules();
     let mut fingerprint = get_rule_fingerprint();
     let mut cooldowns = HashMap::new();
@@ -1699,19 +1690,19 @@ fn run_docker_event_monitor(recovery_states: Arc<Mutex<HashMap<String, RecoveryS
                         if let Some(code)=exit_code { incident.push_str(&format!(" with exit code {}",code)); }
                         incident.push_str(&docker_logs_context(&container));
                         let ctx=IncidentContext{source:"docker_exit",incident,container:Some(container),exit_code,health_status:None};
-                        { let mut shared = recovery_states.lock().unwrap(); process_incident(&rules,&ctx,&mut cooldowns,&mut shared); }
+                        process_incident(&rules,&ctx,&mut cooldowns);
                     }
                     status if status.starts_with("health_status:") => {
                         let health= status.split_once(':').map(|(_,v)|v.trim().to_string()).filter(|s|!s.is_empty());
                         let status_name=health.clone().unwrap_or_else(|| "unhealthy".to_string());
                         let incident=format!("Docker container '{}' health status {}{}",container,status_name,docker_logs_context(&container));
                         let ctx=IncidentContext{source:"docker_health",incident,container:Some(container),exit_code:None,health_status:Some(status_name)};
-                        { let mut shared = recovery_states.lock().unwrap(); process_incident(&rules,&ctx,&mut cooldowns,&mut shared); }
+                        process_incident(&rules,&ctx,&mut cooldowns);
                     }
                     "oom" => {
                         let incident=format!("Docker container '{}' OOM event detected{}",container,docker_logs_context(&container));
                         let ctx=IncidentContext{source:"docker_oom",incident,container:Some(container),exit_code:Some(137),health_status:None};
-                        { let mut shared = recovery_states.lock().unwrap(); process_incident(&rules,&ctx,&mut cooldowns,&mut shared); }
+                        process_incident(&rules,&ctx,&mut cooldowns);
                     }
                     _ => {}
                 }
@@ -1723,44 +1714,214 @@ fn run_docker_event_monitor(recovery_states: Arc<Mutex<HashMap<String, RecoveryS
     }
 }
 
-fn run_http_health_monitor(recovery_states: Arc<Mutex<HashMap<String, RecoveryState>>>) {
+fn docker_container_is_running(container: &str) -> Result<bool, String> {
+    let docker = docker_binary()?;
+    let output = Command::new(docker)
+        .args(["inspect", "--type", "container", "-f", "{{.State.Running}}", container])
+        .output()
+        .map_err(|e| format!("Failed to inspect container '{}': {}", container, e))?;
+    if !output.status.success() {
+        return Ok(false);
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
+}
+
+/// For loopback URLs, prove that the URL's published host port belongs to the
+/// named container. This prevents an HTTP rule from accidentally recovering a
+/// different container that happens to expose the same endpoint.
+fn http_endpoint_matches_container(url: &str, container: &str) -> Result<(), String> {
+    let parsed = Url::parse(url).map_err(|e| format!("Invalid HTTP health URL '{}': {}", url, e))?;
+    let host = parsed.host_str().unwrap_or("");
+    if host != "127.0.0.1" && host != "localhost" {
+        // Non-loopback endpoints may be reverse-proxied or externally routed.
+        // The explicit container field still binds the recovery rule to one
+        // container; only local published-port ownership can be proven here.
+        return Ok(());
+    }
+
+    let host_port = parsed.port_or_known_default()
+        .ok_or_else(|| format!("Could not determine port for HTTP health URL '{}'", url))?;
+    let state = docker_inspect_state(container)
+        .ok_or_else(|| format!("Container '{}' does not exist; cannot bind HTTP endpoint '{}'", container, url))?;
+    let ports = state
+        .get("NetworkSettings")
+        .and_then(|v| v.get("Ports"))
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| format!("Container '{}' has no published Docker ports; cannot bind '{}'", container, url))?;
+
+    for bindings in ports.values() {
+        if let Some(bindings) = bindings.as_array() {
+            for binding in bindings {
+                if binding.get("HostPort").and_then(|v| v.as_str()) == Some(&host_port.to_string()) {
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    Err(format!(
+        "HTTP endpoint '{}' is not published by container '{}'",
+        url, container
+    ))
+}
+
+fn verify_container_http_status(container: &str, url: &str, expected_status: u16) -> bool {
+    let target = match resolve_container_target(container) {
+        Ok(v) => v,
+        Err(e) => { log_incident(&format!("[VERIFY ERROR] {}", e)); return false; }
+    };
+    if let Err(e) = http_endpoint_matches_container(url, &target) {
+        log_incident(&format!("[VERIFY ERROR] {}", e));
+        return false;
+    }
+    if !docker_container_is_running(&target).unwrap_or(false) {
+        return false;
+    }
+    let client = match Client::builder().timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS)).build() {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    match client.get(url).send() {
+        Ok(resp) => resp.status().as_u16() == expected_status,
+        Err(_) => false,
+    }
+}
+
+fn run_http_health_monitor() {
     let mut cooldowns = HashMap::new();
+    let mut reported_http_config_errors: HashSet<String> = HashSet::new();
+    let mut rules = load_all_rules();
+    let mut fingerprint = get_rule_fingerprint();
+
     loop {
-        let rules=load_all_rules();
-        let client=match Client::builder().timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS)).build(){Ok(c)=>c,Err(_)=>{sleep(Duration::from_secs(API_HEALTH_POLL_SECS));continue;}};
+        let current = get_rule_fingerprint();
+        if current != fingerprint {
+            let new_rules = load_all_rules();
+            rules = new_rules;
+            reported_http_config_errors.clear();
+            fingerprint = current;
+        }
+
+        let client = match Client::builder()
+            .timeout(Duration::from_secs(COMMAND_TIMEOUT_SECS))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                log_incident(&format!("[HTTP] Failed to create HTTP client: {}", e));
+                sleep(Duration::from_secs(API_HEALTH_POLL_SECS));
+                continue;
+            }
+        };
+
         for rule in &rules {
-            if let Trigger::HttpHealth{url,expected_status,..}= &rule.trigger {
-                match client.get(url).send() {
-                    Ok(resp) if resp.status().as_u16()==*expected_status => {}
-                    Ok(resp) => {
-                        let ctx=IncidentContext{source:"http_health",incident:format!("HTTP health check failed for {}: got {}, expected {}",url,resp.status(),expected_status),container:None,exit_code:None,health_status:None};
-                        { let mut shared = recovery_states.lock().unwrap(); process_incident(&rules,&ctx,&mut cooldowns,&mut shared); }
+            if let Trigger::HttpHealth { url, container, expected_status, .. } = &rule.trigger {
+                let Some(container_spec) = container.as_deref() else {
+                    // Invalid rules are normally rejected by validation. Keep
+                    // this guard so a malformed rule can never trigger a blind
+                    // recovery if it slips in through a future code path.
+                    continue;
+                };
+                let target = match resolve_trigger_container(container_spec) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let key = format!("{}:resolve", rule.id);
+                        if reported_http_config_errors.insert(key) {
+                            log_incident(&format!("[HTTP] Rule '{}' disabled: {}", rule.id, e));
+                        }
+                        continue;
                     }
-                    Err(e)=>{
-                        let ctx=IncidentContext{source:"http_health",incident:format!("HTTP health check failed for {}: {}",url,e),container:None,exit_code:None,health_status:None};
-                        { let mut shared = recovery_states.lock().unwrap(); process_incident(&rules,&ctx,&mut cooldowns,&mut shared); }
+                };
+                if let Err(e) = http_endpoint_matches_container(url, &target) {
+                    let key = format!("{}:endpoint", rule.id);
+                    if reported_http_config_errors.insert(key) {
+                        log_incident(&format!("[HTTP] Rule '{}' disabled: {}", rule.id, e));
+                    }
+                    continue;
+                }
+
+                match client.get(url).send() {
+                    Ok(resp) if resp.status().as_u16() == *expected_status => {}
+                    Ok(resp) => {
+                        let ctx = IncidentContext {
+                            source: "http_health",
+                            incident: format!(
+                                "HTTP health check failed for container '{}' at {}: got {}, expected {}",
+                                target, url, resp.status(), expected_status
+                            ),
+                            container: Some(target.clone()),
+                            exit_code: None,
+                            health_status: None,
+                        };
+                        process_incident(&rules, &ctx, &mut cooldowns);
+                    }
+                    Err(e) => {
+                        let ctx = IncidentContext {
+                            source: "http_health",
+                            incident: format!(
+                                "HTTP health check failed for container '{}' at {}: {}",
+                                target, url, e
+                            ),
+                            container: Some(target.clone()),
+                            exit_code: None,
+                            health_status: None,
+                        };
+                        process_incident(&rules, &ctx, &mut cooldowns);
                     }
                 }
             }
+
             if let Trigger::ContainerProbe { container, executable, args, .. } = &rule.trigger {
-                let target = match resolve_trigger_container(container) { Ok(v) => v, Err(_) => continue };
-                let docker = match docker_binary() { Ok(v) => v, Err(_) => continue };
+                let target = match resolve_trigger_container(container) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let docker = match docker_binary() {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
                 let mut full = vec!["exec".to_string(), target.clone(), executable.clone()];
                 full.extend(args.iter().cloned());
                 match execute_command_capture(docker, &full, COMMAND_TIMEOUT_SECS) {
                     Ok((0, _, _)) => {}
                     Ok((code, stdout, stderr)) => {
-                        let ctx=IncidentContext{source:"container_probe",incident:format!("Container probe '{}' failed for '{}' with exit code {} stdout={} stderr={}",executable,target,code,stdout.trim(),stderr.trim()),container:Some(target),exit_code:Some(code),health_status:None};
-                        { let mut shared = recovery_states.lock().unwrap(); process_incident(&rules,&ctx,&mut cooldowns,&mut shared); }
+                        let ctx = IncidentContext {
+                            source: "container_probe",
+                            incident: format!(
+                                "Container probe '{}' failed for '{}' with exit code {} stdout={} stderr={}",
+                                executable, target, code, stdout.trim(), stderr.trim()
+                            ),
+                            container: Some(target),
+                            exit_code: Some(code),
+                            health_status: None,
+                        };
+                        process_incident(&rules, &ctx, &mut cooldowns);
                     }
                     Err(e) => {
-                        let ctx=IncidentContext{source:"container_probe",incident:format!("Container probe '{}' failed for '{}': {}",executable,target,e),container:Some(target),exit_code:None,health_status:None};
-                        { let mut shared = recovery_states.lock().unwrap(); process_incident(&rules,&ctx,&mut cooldowns,&mut shared); }
+                        let ctx = IncidentContext {
+                            source: "container_probe",
+                            incident: format!("Container probe '{}' failed for '{}': {}", executable, target, e),
+                            container: Some(target),
+                            exit_code: None,
+                            health_status: None,
+                        };
+                        process_incident(&rules, &ctx, &mut cooldowns);
                     }
                 }
             }
         }
-        let interval=rules.iter().filter_map(|r| match &r.trigger { Trigger::HttpHealth{interval_secs,..} => Some(*interval_secs), Trigger::ContainerProbe{interval_secs,..} => Some(*interval_secs), _ => None }).min().unwrap_or(API_HEALTH_POLL_SECS).max(1);
+
+        cleanup_cooldowns(&mut cooldowns);
+        let interval = rules
+            .iter()
+            .filter_map(|r| match &r.trigger {
+                Trigger::HttpHealth { interval_secs, .. } => Some(*interval_secs),
+                Trigger::ContainerProbe { interval_secs, .. } => Some(*interval_secs),
+                _ => None,
+            })
+            .min()
+            .unwrap_or(API_HEALTH_POLL_SECS)
+            .max(1);
         sleep(Duration::from_secs(interval));
     }
 }
@@ -1838,14 +1999,13 @@ fn run_monitor() {
         }
     };
     let mut cooldowns: HashMap<String, Instant> = HashMap::new();
-    let recovery_states: Arc<Mutex<HashMap<String, RecoveryState>>> = Arc::new(Mutex::new(HashMap::new()));
     log_incident("[INFO] Monitoring new log entries...");
 
     let docker_enabled = docker_binary().is_ok();
-    { let state = Arc::clone(&recovery_states); std::thread::spawn(move || run_http_health_monitor(state)); }
+    std::thread::spawn(run_http_health_monitor);
     log_incident("[HTTP] HTTP health monitoring worker enabled");
     if docker_enabled {
-        { let state = Arc::clone(&recovery_states); std::thread::spawn(move || run_docker_event_monitor(state)); }
+        std::thread::spawn(run_docker_event_monitor);
         log_incident("[DOCKER] Docker event monitoring enabled");
     } else {
         log_incident("[DOCKER] Docker binary not found; Docker event monitoring disabled");
@@ -1926,7 +2086,7 @@ fn run_monitor() {
                 let trimmed = line.trim();
                 if trimmed.contains("[ERROR]") || trimmed.contains("[CRITICAL]") {
                     let ctx = IncidentContext::log(trimmed.to_string());
-                    { let mut shared = recovery_states.lock().unwrap(); process_incident(&rules, &ctx, &mut cooldowns, &mut shared); }
+                    process_incident(&rules, &ctx, &mut cooldowns);
                 }
             }
         }
@@ -2187,7 +2347,6 @@ mod tests {
             verification: Verification::None,
             action: "alert_only".into(),
             priority: 10,
-            escalation: vec![],
         };
         let ctx = IncidentContext {
             source: "docker_exit",
@@ -2212,7 +2371,6 @@ mod tests {
             verification: Verification::None,
             action: "alert_only".into(),
             priority: 1,
-            escalation: vec![],
         };
         let ctx = IncidentContext {
             source: "docker_exit",
@@ -2258,7 +2416,7 @@ mod tests {
     }
 
     #[test]
-    fn docker_restart_detection_works() {
+    fn docker_restart_must_be_last_command() {
         assert!(command_contains_docker_restart("docker restart my-app"));
         assert!(command_contains_docker_restart("/usr/bin/docker restart my-app"));
         assert!(!command_contains_docker_restart("docker inspect my-app"));
@@ -2271,6 +2429,19 @@ mod tests {
             "name":"sequence-invalid",
             "error_patterns":["sequence"],
             "remediation":{"type":"command_sequence","commands":["true","true"],"verifications":[{"type":"command_success","executable":"true"}]},
+            "verification":{"type":"none"}
+        }"#;
+        let rule: Rule = serde_json::from_str(json).unwrap();
+        assert!(validate_rule(&rule).is_err());
+    }
+
+    #[test]
+    fn command_sequence_rejects_docker_restart_before_final_step() {
+        let json = r#"{
+            "id":"sequence-restart-order",
+            "name":"sequence-restart-order",
+            "error_patterns":["sequence"],
+            "remediation":{"type":"command_sequence","commands":["docker restart app","true"],"verifications":[{"type":"command_success","executable":"true"},{"type":"command_success","executable":"true"}]},
             "verification":{"type":"none"}
         }"#;
         let rule: Rule = serde_json::from_str(json).unwrap();
