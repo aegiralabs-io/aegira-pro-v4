@@ -1,0 +1,53 @@
+name: Build Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: Build Linux Binary
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      
+      - name: Build release
+        run: cargo build --release
+      
+      - name: Prepare package
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          if [ -z "$VERSION" ] || [ "$VERSION" = "$GITHUB_REF" ]; then
+            VERSION="dev"
+          fi
+          
+          mkdir -p dist/aegira-$VERSION
+          cp target/release/aegira dist/aegira-$VERSION/
+          cp install.sh dist/aegira-$VERSION/
+          cp rules.json dist/aegira-$VERSION/ 2>/dev/null || echo "[]" > dist/aegira-$VERSION/rules.json
+          cp README.md dist/aegira-$VERSION/ 2>/dev/null || true
+          
+          cd dist
+          tar -czf aegira-$VERSION-x86_64-linux.tar.gz aegira-$VERSION/
+          
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+      
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aegira-binary
+          path: dist/*.tar.gz
+      
+      - name: Create Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/*.tar.gz
+          generate_release_notes: true
