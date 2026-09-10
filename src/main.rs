@@ -24,6 +24,7 @@ const VERIFY_DELAY_SECS: u64 = 2;
 const MAX_VERIFY_ATTEMPTS: u32 = 5;
 const INCIDENT_COOLDOWN_SECS: u64 = 30;
 const MAX_INCIDENT_LOG_BYTES: u64 = 10 * 1024 * 1024;
+const MAX_INCIDENT_LOG_BACKUPS: u32 = 3;
 const DOCKER_EVENT_RECONNECT_SECS: u64 = 3;
 const DOCKER_LOG_TAIL_LINES: u32 = 80;
 const API_HEALTH_POLL_SECS: u64 = 5;
@@ -32,8 +33,6 @@ const MAX_COMMAND_SEQUENCE_LENGTH: usize = 5;
 const MIN_MATCH_SCORE: i32 = 60;
 const SELF_SERVICE: &str = "aegira";
 
-// Pro licensing is intentionally disabled during development/testing.
-// Re-enable server-side license enforcement for production after billing is wired.
 const LICENSE_ENFORCEMENT_ENABLED: bool = false;
 
 const COMPOSIO_BASE_URL: &str = "https://backend.composio.dev/api/v3.1";
@@ -378,16 +377,25 @@ fn rotate_incident_log_if_needed() {
         return;
     }
 
-    let rotated =
-        Path::new(LOGS_DIR).join("incident.log.1");
+    for index in (1..=MAX_INCIDENT_LOG_BACKUPS).rev() {
+        if index == MAX_INCIDENT_LOG_BACKUPS {
+            let oldest = Path::new(LOGS_DIR).join(format!("incident.log.{}", index));
+            let _ = fs::remove_file(&oldest);
+        }
+        if index < MAX_INCIDENT_LOG_BACKUPS {
+            let src = Path::new(LOGS_DIR).join(format!("incident.log.{}", index));
+            let dst = Path::new(LOGS_DIR).join(format!("incident.log.{}", index + 1));
+            if src.exists() {
+                let _ = fs::rename(&src, &dst);
+            }
+        }
+    }
 
+    let rotated = Path::new(LOGS_DIR).join("incident.log.1");
     let _ = fs::remove_file(&rotated);
 
     if let Err(e) = fs::rename(path, &rotated) {
-        eprintln!(
-            "[LOG ERROR] Failed to rotate incident log: {}",
-            e
-        );
+        eprintln!("[LOG ERROR] Failed to rotate incident log: {}", e);
         return;
     }
 
@@ -434,7 +442,6 @@ fn command_contains_docker_restart(command: &str) -> bool {
     })
 }
 
-// NEW: Detect destructive commands and block them at validation and runtime.
 fn is_destructive_command(command: &str) -> Option<&'static str> {
     let lowered = command.to_lowercase();
     let trimmed = lowered.trim();
@@ -453,7 +460,6 @@ fn is_destructive_command(command: &str) -> Option<&'static str> {
         ("parted", "partition modification"),
         (":(){ :|:& };:", "fork bomb"),
         ("chmod -r 777 /", "world-writable root"),
-        ("chown -r", "recursive ownership change"),
         ("> /dev/sda", "raw disk write"),
         ("> /dev/nvme", "raw disk write"),
         ("shutdown", "system shutdown"),
@@ -476,6 +482,17 @@ fn is_destructive_command(command: &str) -> Option<&'static str> {
         for critical in &[" / ", " /* ", " /etc", " /usr", " /var", " /bin", " /boot", " /sys", " /proc", " /dev", " ~ "] {
             if trimmed.contains(critical) {
                 return Some("recursive delete of critical path");
+            }
+        }
+    }
+
+    if trimmed.contains("chown -r") {
+        for critical in &[
+            " / ", " /* ", " /etc", " /usr", " /var", " /bin", " /boot",
+            " /sys", " /proc", " /dev", " /lib", " /sbin", " /root",
+        ] {
+            if trimmed.contains(critical) {
+                return Some("recursive ownership change on critical path");
             }
         }
     }
@@ -632,7 +649,6 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
         Remediation::AlertOnly => {}
     }
 
-    // NEW: Block destructive commands in rule definitions.
     match &rule.remediation {
         Remediation::Command { executable, args } => {
             let full = format!("{} {}", executable, args.join(" "));
@@ -797,7 +813,6 @@ fn load_rules_from_directory(
     rules
 }
 
-// UPDATED: Built-in fallback rules now use generic placeholders.
 fn get_hardcoded_default_rules() -> Vec<Rule> {
     vec![
         Rule {
@@ -884,7 +899,6 @@ fn get_hardcoded_default_rules() -> Vec<Rule> {
     ]
 }
 
-// UPDATED: Filters out disabled rules from config.
 fn load_all_rules() -> Vec<Rule> {
     let mut rules = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -920,13 +934,12 @@ fn load_all_rules() -> Vec<Rule> {
 
     if rules.is_empty() {
         log_incident(
-            "[RULES] No external rules loaded. Using fallback rule."
+            "[RULES] No external rules loaded. Using fallback rules."
         );
 
         rules = get_hardcoded_default_rules();
     }
 
-    // NEW: Filter out disabled rules from config.
     let disabled: HashSet<String> = load_config()
         .map(|c| c.disabled_rules.iter().map(|id| id.trim().to_lowercase()).collect())
         .unwrap_or_default();
@@ -1203,7 +1216,6 @@ fn execute_command(
     }
 }
 
-// UPDATED: Now captures stdout/stderr from pipes.
 fn execute_command_capture(executable: &str, args: &[String], timeout_secs: u64) -> Result<(i32, String, String), String> {
     log_incident(&format!("[EXEC] {} {}", executable, args.join(" ")));
     let mut child = Command::new(executable)
@@ -1213,35 +1225,52 @@ fn execute_command_capture(executable: &str, args: &[String], timeout_secs: u64)
         .spawn()
         .map_err(|e| format!("Failed to start {}: {}", executable, e))?;
 
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
+    let stdout_pipe = child.stdout.take();
+    let stderr_pipe = child.stderr.take();
+
+    let stdout_handle = stdout_pipe.map(|mut reader| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = reader.read_to_string(&mut buf);
+            buf
+        })
+    });
+    let stderr_handle = stderr_pipe.map(|mut reader| {
+        std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = reader.read_to_string(&mut buf);
+            buf
+        })
+    });
 
     let start = Instant::now();
-    loop {
+    let status = loop {
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                let mut stderr = String::new();
-                if let Some(mut out) = stdout_pipe.take() {
-                    let _ = out.read_to_string(&mut stdout);
-                }
-                if let Some(mut err) = stderr_pipe.take() {
-                    let _ = err.read_to_string(&mut stderr);
-                }
-                return Ok((status.code().unwrap_or(-1), stdout, stderr));
-            }
+            Ok(Some(status)) => break status,
             Ok(None) if start.elapsed() >= Duration::from_secs(timeout_secs) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return Err(format!("{} timed out after {} seconds", executable, timeout_secs));
             }
             Ok(None) => sleep(Duration::from_millis(100)),
-            Err(e) => return Err(format!("Failed waiting for {}: {}", executable, e)),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("Failed waiting for {}: {}", executable, e));
+            }
         }
-    }
+    };
+
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+
+    Ok((status.code().unwrap_or(-1), stdout, stderr))
 }
 
-// UPDATED: Drains pipes on background threads to prevent deadlock.
 fn execute_command_sequence(
     commands: &[String],
     verifications: &[Verification],
@@ -1310,17 +1339,17 @@ fn execute_command_sequence(
             .spawn()
             .map_err(|e| format!("Command {} failed to start: {}", step, e))?;
 
-        let mut stdout_pipe = child.stdout.take();
-        let mut stderr_pipe = child.stderr.take();
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
 
-        let stdout_handle = stdout_pipe.take().map(|mut reader| {
+        let stdout_handle = stdout_pipe.map(|mut reader| {
             std::thread::spawn(move || {
                 let mut buf = String::new();
                 let _ = reader.read_to_string(&mut buf);
                 buf
             })
         });
-        let stderr_handle = stderr_pipe.take().map(|mut reader| {
+        let stderr_handle = stderr_pipe.map(|mut reader| {
             std::thread::spawn(move || {
                 let mut buf = String::new();
                 let _ = reader.read_to_string(&mut buf);
@@ -1460,7 +1489,6 @@ fn container_display_name(id: &str) -> String {
     docker_inspect_state(id).and_then(|v| v.get("Name").and_then(|n| n.as_str()).map(|s| s.trim_start_matches('/').to_string())).unwrap_or_else(|| id.to_string())
 }
 
-// UPDATED: Malformed lines are now skipped instead of aborting the whole lookup.
 fn env_value(name: &str) -> Option<String> {
     if let Ok(value) = std::env::var(name) {
         if !value.trim().is_empty() {
@@ -1487,14 +1515,15 @@ fn env_value(name: &str) -> Option<String> {
     None
 }
 
-fn send_gmail_alert(subject: &str, body: &str) -> Result<(), String> {
+fn send_gmail_alert(subject: &str, body: &str, config: &AegiraConfig) -> Result<(), String> {
     let api_key = env_value("COMPOSIO_API_KEY")
         .ok_or_else(|| "COMPOSIO_API_KEY is not configured".to_string())?;
-    let config = load_config()?;
-    let user_id = config.alerts.composio_user_id
+
+    let user_id = config.alerts.composio_user_id.clone()
         .or_else(|| env_value("COMPOSIO_USER_ID"))
         .ok_or_else(|| "Composio user ID is not configured. Set COMPOSIO_USER_ID or configure alerts.composio_user_id.".to_string())?;
-    let recipient = config.alerts.recipient_email
+
+    let recipient = config.alerts.recipient_email.clone()
         .or_else(|| env_value("AEGIRA_ALERT_EMAIL"))
         .ok_or_else(|| "Alert recipient is not configured. Set AEGIRA_ALERT_EMAIL or configure alerts.recipient_email.".to_string())?;
 
@@ -1548,7 +1577,7 @@ fn send_alert(subject: &str, body: &str) {
         return;
     }
 
-    if let Err(e) = send_gmail_alert(subject, body) {
+    if let Err(e) = send_gmail_alert(subject, body, &config) {
         log_incident(&format!("[ALERT ERROR] {}", e));
     }
 }
@@ -1575,7 +1604,6 @@ fn remediation_allowed() -> bool {
 }
 
 fn perform_remediation(remediation: &Remediation, ctx: Option<&IncidentContext>, rule: &Rule) -> Result<(), String> {
-    // NEW: Runtime safety net — block destructive commands even if they slipped past validation.
     match remediation {
         Remediation::Command { executable, args } => {
             let full = format!("{} {}", executable, args.join(" "));
@@ -1685,7 +1713,6 @@ fn recover_with_rule(
     rule: &Rule,
     ctx: &IncidentContext,
 ) -> Result<(), String> {
-    // UPDATED: Single compact log line instead of multiple.
     log_incident(&format!(
         "[RECOVER] rule_id={} name={}",
         rule.id, rule.name
@@ -1786,7 +1813,6 @@ fn describe_remediation(remediation: &Remediation) -> String {
     }
 }
 
-// UPDATED: Single compact log line instead of multiple.
 fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashMap<String, Instant>) {
     cleanup_cooldowns(cooldowns);
     let start = Instant::now();
@@ -1807,7 +1833,6 @@ fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashM
     if cooldowns.contains_key(&key) { return; }
     cooldowns.insert(key, Instant::now());
 
-    // UPDATED: Single compact log line.
     log_incident(&format!(
         "[WATCHER] source={} container={} rule={} score={} incident={}",
         ctx.source,
@@ -1903,49 +1928,140 @@ fn run_docker_event_monitor() {
     let mut fingerprint = get_rule_fingerprint();
     let mut cooldowns = HashMap::new();
     let mut seen_events: HashMap<String, Instant> = HashMap::new();
+    let mut consecutive_failures: u32 = 0;
+
     loop {
         seen_events.retain(|_, timestamp| timestamp.elapsed() < Duration::from_secs(INCIDENT_COOLDOWN_SECS));
-        let docker = match docker_binary() { Ok(v)=>v, Err(e)=>{log_incident(&format!("[DOCKER] {}",e)); sleep(Duration::from_secs(DOCKER_EVENT_RECONNECT_SECS)); continue;} };
-        log_incident("[DOCKER] Starting Docker event monitor");
-        let mut child = match Command::new(docker).args(["events", "--filter", "type=container", "--format", "{{json .}}"]).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
-            Ok(c)=>c, Err(e)=>{log_incident(&format!("[DOCKER] Failed to start docker events: {}",e)); sleep(Duration::from_secs(DOCKER_EVENT_RECONNECT_SECS)); continue;}
+
+        let docker = match docker_binary() {
+            Ok(v) => {
+                if consecutive_failures > 0 {
+                    log_incident(&format!(
+                        "[DOCKER] Docker binary recovered after {} failed attempt(s)",
+                        consecutive_failures
+                    ));
+                    consecutive_failures = 0;
+                }
+                v
+            }
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures <= 3 || consecutive_failures % 10 == 0 {
+                    log_incident(&format!(
+                        "[DOCKER] {} (failure #{})",
+                        e, consecutive_failures
+                    ));
+                }
+                let backoff = std::cmp::min(
+                    DOCKER_EVENT_RECONNECT_SECS.saturating_mul(
+                        1u64 << std::cmp::min(consecutive_failures, 5)
+                    ),
+                    60,
+                );
+                sleep(Duration::from_secs(backoff));
+                continue;
+            }
         };
-        if let Some(stdout)=child.stdout.take() {
-            let reader=BufReader::new(stdout);
+
+        log_incident("[DOCKER] Starting Docker event monitor");
+        let mut child = match Command::new(docker)
+            .args(["events", "--filter", "type=container", "--format", "{{json .}}"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                consecutive_failures = consecutive_failures.saturating_add(1);
+                if consecutive_failures <= 3 || consecutive_failures % 10 == 0 {
+                    log_incident(&format!(
+                        "[DOCKER] Failed to start docker events: {} (failure #{})",
+                        e, consecutive_failures
+                    ));
+                }
+                let backoff = std::cmp::min(
+                    DOCKER_EVENT_RECONNECT_SECS.saturating_mul(
+                        1u64 << std::cmp::min(consecutive_failures, 5)
+                    ),
+                    60,
+                );
+                sleep(Duration::from_secs(backoff));
+                continue;
+            }
+        };
+
+        consecutive_failures = 0;
+
+        if let Some(stdout) = child.stdout.take() {
+            let reader = BufReader::new(stdout);
             for line in reader.lines().flatten() {
                 let current = get_rule_fingerprint();
-                if current != fingerprint { let nr=load_all_rules(); if !nr.is_empty(){rules=nr; fingerprint=current;} }
-                let Some((status,id,exit_code,name))=parse_docker_event_line(&line) else { continue };
+                if current != fingerprint {
+                    let nr = load_all_rules();
+                    if !nr.is_empty() {
+                        rules = nr;
+                        fingerprint = current;
+                    }
+                }
+                let Some((status, id, exit_code, name)) = parse_docker_event_line(&line) else { continue };
                 seen_events.retain(|_, timestamp| timestamp.elapsed() < Duration::from_secs(INCIDENT_COOLDOWN_SECS));
                 let event_key = format!("{}:{}:{}", id, status, exit_code.map(|v| v.to_string()).unwrap_or_default());
                 if seen_events.contains_key(&event_key) { continue; }
                 seen_events.insert(event_key, Instant::now());
-                let container=name.unwrap_or_else(|| container_display_name(&id));
+                let container = name.unwrap_or_else(|| container_display_name(&id));
                 match status.as_str() {
                     "die" => {
-                        let mut incident=format!("Docker container '{}' exited", container);
-                        if let Some(code)=exit_code { incident.push_str(&format!(" with exit code {}",code)); }
+                        let mut incident = format!("Docker container '{}' exited", container);
+                        if let Some(code) = exit_code {
+                            incident.push_str(&format!(" with exit code {}", code));
+                        }
                         incident.push_str(&docker_logs_context(&container));
-                        let ctx=IncidentContext{source:"docker_exit",incident,container:Some(container),exit_code,health_status:None};
-                        process_incident(&rules,&ctx,&mut cooldowns);
+                        let ctx = IncidentContext {
+                            source: "docker_exit",
+                            incident,
+                            container: Some(container),
+                            exit_code,
+                            health_status: None,
+                        };
+                        process_incident(&rules, &ctx, &mut cooldowns);
                     }
                     status if status.starts_with("health_status:") => {
-                        let health= status.split_once(':').map(|(_,v)|v.trim().to_string()).filter(|s|!s.is_empty());
-                        let status_name=health.clone().unwrap_or_else(|| "unhealthy".to_string());
-                        let incident=format!("Docker container '{}' health status {}{}",container,status_name,docker_logs_context(&container));
-                        let ctx=IncidentContext{source:"docker_health",incident,container:Some(container),exit_code:None,health_status:Some(status_name)};
-                        process_incident(&rules,&ctx,&mut cooldowns);
+                        let health = status.split_once(':').map(|(_, v)| v.trim().to_string()).filter(|s| !s.is_empty());
+                        let status_name = health.clone().unwrap_or_else(|| "unhealthy".to_string());
+                        let incident = format!(
+                            "Docker container '{}' health status {}{}",
+                            container, status_name, docker_logs_context(&container)
+                        );
+                        let ctx = IncidentContext {
+                            source: "docker_health",
+                            incident,
+                            container: Some(container),
+                            exit_code: None,
+                            health_status: Some(status_name),
+                        };
+                        process_incident(&rules, &ctx, &mut cooldowns);
                     }
                     "oom" => {
-                        let incident=format!("Docker container '{}' OOM event detected{}",container,docker_logs_context(&container));
-                        let ctx=IncidentContext{source:"docker_oom",incident,container:Some(container),exit_code:Some(137),health_status:None};
-                        process_incident(&rules,&ctx,&mut cooldowns);
+                        let incident = format!(
+                            "Docker container '{}' OOM event detected{}",
+                            container, docker_logs_context(&container)
+                        );
+                        let ctx = IncidentContext {
+                            source: "docker_oom",
+                            incident,
+                            container: Some(container),
+                            exit_code: Some(137),
+                            health_status: None,
+                        };
+                        process_incident(&rules, &ctx, &mut cooldowns);
                     }
                     _ => {}
                 }
             }
         }
-        let _=child.kill(); let _=child.wait();
+
+        let _ = child.kill();
+        let _ = child.wait();
         log_incident("[DOCKER] Docker event stream ended; reconnecting");
         sleep(Duration::from_secs(DOCKER_EVENT_RECONNECT_SECS));
     }
@@ -2460,7 +2576,6 @@ fn run_configure(args: &[String]) -> Result<(), String> {
     save_config(&config)
 }
 
-// NEW: One-command setup. Automatically chooses service vs container.
 fn run_configure_auto(args: &[String]) -> Result<(), String> {
     if unsafe { libc_geteuid() } != 0 {
         return Err("Configuration must be run as root. Use sudo.".to_string());
@@ -2571,7 +2686,6 @@ fn run_show_rules() -> Result<(), String> {
     Ok(())
 }
 
-// NEW: Disable a rule via config.
 fn run_rules_disable(rule_id: &str) -> Result<(), String> {
     if unsafe { libc_geteuid() } != 0 {
         return Err("Configuration must be run as root. Use sudo.".to_string());
@@ -2580,18 +2694,42 @@ fn run_rules_disable(rule_id: &str) -> Result<(), String> {
     if rule_id.is_empty() {
         return Err("Rule ID cannot be empty.".to_string());
     }
-    let mut config = load_config()?;
+
     let normalized = rule_id.to_lowercase();
-    if !config.disabled_rules.iter().any(|r| r.to_lowercase() == normalized) {
-        config.disabled_rules.push(rule_id.to_string());
-        save_config(&config)?;
+
+    let known_ids: HashSet<String> = {
+        let mut ids = HashSet::new();
+        for dir in [BUILTIN_RULES_DIR, CUSTOM_RULES_DIR] {
+            for rule in load_rules_from_directory(Path::new(dir)) {
+                ids.insert(rule.id.trim().to_lowercase());
+            }
+        }
+        for rule in get_hardcoded_default_rules() {
+            ids.insert(rule.id.trim().to_lowercase());
+        }
+        ids
+    };
+
+    if !known_ids.contains(&normalized) {
+        return Err(format!(
+            "Rule '{}' not found. Use 'aegira rules list' to see available rules.",
+            rule_id
+        ));
     }
-    log_incident(&format!("[CONFIG] Rule disabled: {}", rule_id));
-    println!("[RULES] Disabled: {}", rule_id);
+
+    let mut config = load_config()?;
+    if !config.disabled_rules.iter().any(|r| r.trim().to_lowercase() == normalized) {
+        config.disabled_rules.push(normalized.clone());
+        save_config(&config)?;
+        log_incident(&format!("[CONFIG] Rule disabled: {}", normalized));
+        println!("[RULES] Disabled: {}", normalized);
+    } else {
+        println!("[RULES] Already disabled: {}", normalized);
+    }
+
     Ok(())
 }
 
-// NEW: Enable a previously disabled rule.
 fn run_rules_enable(rule_id: &str) -> Result<(), String> {
     if unsafe { libc_geteuid() } != 0 {
         return Err("Configuration must be run as root. Use sudo.".to_string());
@@ -2600,46 +2738,84 @@ fn run_rules_enable(rule_id: &str) -> Result<(), String> {
     if rule_id.is_empty() {
         return Err("Rule ID cannot be empty.".to_string());
     }
-    let mut config = load_config()?;
+
     let normalized = rule_id.to_lowercase();
+    let mut config = load_config()?;
     let before = config.disabled_rules.len();
-    config.disabled_rules.retain(|r| r.to_lowercase() != normalized);
+    config.disabled_rules.retain(|r| r.trim().to_lowercase() != normalized);
+
     if config.disabled_rules.len() == before {
-        println!("[RULES] Rule was not disabled: {}", rule_id);
+        println!("[RULES] Rule was not disabled: {}", normalized);
         return Ok(());
     }
+
     save_config(&config)?;
-    log_incident(&format!("[CONFIG] Rule enabled: {}", rule_id));
-    println!("[RULES] Enabled: {}", rule_id);
+    log_incident(&format!("[CONFIG] Rule enabled: {}", normalized));
+    println!("[RULES] Enabled: {}", normalized);
     Ok(())
 }
 
-// NEW: List all rules with enabled/disabled status.
 fn run_rules_list() -> Result<(), String> {
-    let rules = load_all_rules();
     let config = load_config().unwrap_or_default();
     let disabled: HashSet<String> = config.disabled_rules
         .iter()
         .map(|id| id.trim().to_lowercase())
         .collect();
 
-    println!();
-    println!("Active rules: {}", rules.len());
-    println!("Disabled rules: {}", disabled.len());
-    println!();
-    println!("{:<30} {:<40} {:<10}", "ID", "NAME", "STATUS");
-    println!("{}", "-".repeat(82));
-    for rule in &rules {
-        let status = if disabled.contains(&rule.id.to_lowercase()) { "disabled" } else { "enabled" };
-        println!("{:<30} {:<40} {:<10}", rule.id, rule.name, status);
+    let mut all_rules: Vec<Rule> = Vec::new();
+    let mut seen_ids = HashSet::new();
+
+    for dir in [BUILTIN_RULES_DIR, CUSTOM_RULES_DIR] {
+        for rule in load_rules_from_directory(Path::new(dir)) {
+            let id = rule.id.trim().to_lowercase();
+            if let Some(index) = all_rules.iter().position(|r| r.id.trim().eq_ignore_ascii_case(&id)) {
+                all_rules[index] = rule;
+            } else if seen_ids.insert(id) {
+                all_rules.push(rule);
+            }
+        }
     }
-    if !disabled.is_empty() {
+
+    if all_rules.is_empty() {
+        all_rules = get_hardcoded_default_rules();
+    }
+
+    all_rules.sort_by(|a, b| {
+        b.priority.cmp(&a.priority)
+            .then_with(|| a.id.cmp(&b.id))
+    });
+
+    let total = all_rules.len();
+    let disabled_count = all_rules
+        .iter()
+        .filter(|r| disabled.contains(&r.id.trim().to_lowercase()))
+        .count();
+    let enabled_count = total - disabled_count;
+
+    println!();
+    println!("Total rules: {}", total);
+    println!("Enabled: {}", enabled_count);
+    println!("Disabled: {}", disabled_count);
+    println!();
+    println!("{:<32} {:<40} {:<10}", "ID", "NAME", "STATUS");
+    println!("{}", "-".repeat(84));
+    for rule in &all_rules {
+        let status = if disabled.contains(&rule.id.trim().to_lowercase()) {
+            "disabled"
+        } else {
+            "enabled"
+        };
+        println!("{:<32} {:<40} {:<10}", rule.id, rule.name, status);
+    }
+
+    if !config.disabled_rules.is_empty() {
         println!();
-        println!("Disabled (not active):");
+        println!("Disabled rule IDs in config:");
         for id in &config.disabled_rules {
             println!("  - {}", id);
         }
     }
+
     Ok(())
 }
 
@@ -2794,7 +2970,6 @@ mod tests {
         assert!(matches!(rule.trigger, Trigger::Log));
     }
 
-    // NEW: Destructive command detection tests.
     #[test]
     fn detects_destructive_commands() {
         assert!(is_destructive_command("rm -rf /").is_some());
@@ -2813,6 +2988,13 @@ mod tests {
         assert!(is_destructive_command("docker restart my-app").is_none());
         assert!(is_destructive_command("rm -rf /tmp/aegira-test").is_none());
         assert!(is_destructive_command("curl http://localhost/health").is_none());
+        assert!(is_destructive_command("chown -R user:user /tmp/myapp").is_none());
+    }
+
+    #[test]
+    fn blocks_chown_on_critical_path() {
+        assert!(is_destructive_command("chown -R user /etc").is_some());
+        assert!(is_destructive_command("chown -r user /usr").is_some());
     }
 
     #[test]
