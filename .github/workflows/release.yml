@@ -31,8 +31,11 @@ jobs:
           mkdir -p dist/aegira-$VERSION
           cp target/release/aegira dist/aegira-$VERSION/
           cp install.sh dist/aegira-$VERSION/
+          cp beta-test.sh dist/aegira-$VERSION/ 2>/dev/null || true
+          cp complex-test.sh dist/aegira-$VERSION/ 2>/dev/null || true
           cp rules.json dist/aegira-$VERSION/ 2>/dev/null || echo "[]" > dist/aegira-$VERSION/rules.json
           cp README.md dist/aegira-$VERSION/ 2>/dev/null || true
+          cp BETA_TESTING.md dist/aegira-$VERSION/ 2>/dev/null || true
           
           cd dist
           tar -czf aegira-$VERSION-x86_64-linux.tar.gz aegira-$VERSION/
