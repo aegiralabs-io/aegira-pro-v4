@@ -52,6 +52,8 @@ struct AegiraConfig {
     #[serde(default)]
     #[allow(dead_code)]
     license_key: Option<String>,
+    #[serde(default)]
+    disabled_rules: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -189,8 +191,6 @@ enum Trigger {
     },
     HttpHealth {
         url: String,
-        /// Explicit Docker container owning this HTTP endpoint.
-        /// Rules should always set this for automatic recovery.
         #[serde(default)]
         container: Option<String>,
         #[serde(default = "default_expected_status")]
@@ -434,6 +434,55 @@ fn command_contains_docker_restart(command: &str) -> bool {
     })
 }
 
+// NEW: Detect destructive commands and block them at validation and runtime.
+fn is_destructive_command(command: &str) -> Option<&'static str> {
+    let lowered = command.to_lowercase();
+    let trimmed = lowered.trim();
+
+    let exact_patterns: &[(&str, &str)] = &[
+        ("rm -rf /", "recursive delete of root"),
+        ("rm -rf /*", "recursive delete of root"),
+        ("rm -fr /", "recursive delete of root"),
+        ("rm -rf ~", "recursive delete of home"),
+        ("rm -rf $home", "recursive delete of home"),
+        ("dd if=/dev/zero", "disk overwrite"),
+        ("dd if=/dev/random", "disk overwrite"),
+        ("dd if=/dev/urandom", "disk overwrite"),
+        ("mkfs", "filesystem format"),
+        ("fdisk", "partition modification"),
+        ("parted", "partition modification"),
+        (":(){ :|:& };:", "fork bomb"),
+        ("chmod -r 777 /", "world-writable root"),
+        ("chown -r", "recursive ownership change"),
+        ("> /dev/sda", "raw disk write"),
+        ("> /dev/nvme", "raw disk write"),
+        ("shutdown", "system shutdown"),
+        ("reboot", "system reboot"),
+        ("halt", "system halt"),
+        ("poweroff", "system poweroff"),
+        ("init 0", "system shutdown"),
+        ("init 6", "system reboot"),
+        ("kill -9 1", "kill init process"),
+        ("killall5", "kill all processes"),
+    ];
+
+    for (pattern, reason) in exact_patterns {
+        if trimmed.contains(pattern) {
+            return Some(reason);
+        }
+    }
+
+    if trimmed.contains("rm ") && (trimmed.contains(" -rf ") || trimmed.contains(" -fr ")) {
+        for critical in &[" / ", " /* ", " /etc", " /usr", " /var", " /bin", " /boot", " /sys", " /proc", " /dev", " ~ "] {
+            if trimmed.contains(critical) {
+                return Some("recursive delete of critical path");
+            }
+        }
+    }
+
+    None
+}
+
 fn validate_verification(verification: &Verification, rule_id: &str, allow_none: bool) -> Result<(), String> {
     match verification {
         Verification::ServiceActive { service } => {
@@ -583,6 +632,38 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
         Remediation::AlertOnly => {}
     }
 
+    // NEW: Block destructive commands in rule definitions.
+    match &rule.remediation {
+        Remediation::Command { executable, args } => {
+            let full = format!("{} {}", executable, args.join(" "));
+            if let Some(reason) = is_destructive_command(&full) {
+                return Err(format!(
+                    "Rule '{}' contains a destructive command ({}): {}",
+                    rule.id, reason, full
+                ));
+            }
+        }
+        Remediation::ContainerExec { args, .. } => {
+            let full = args.join(" ");
+            if let Some(reason) = is_destructive_command(&full) {
+                return Err(format!(
+                    "Rule '{}' contains a destructive container_exec command ({}): {}",
+                    rule.id, reason, full
+                ));
+            }
+        }
+        Remediation::CommandSequence { commands, .. } => {
+            for cmd in commands {
+                if let Some(reason) = is_destructive_command(cmd) {
+                    return Err(format!(
+                        "Rule '{}' command_sequence contains a destructive command ({}): {}",
+                        rule.id, reason, cmd
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
 
     validate_verification(&rule.verification, &rule.id, true)?;
 
@@ -610,7 +691,6 @@ fn validate_rule(rule: &Rule) -> Result<(), String> {
             }
         }
     }
-
 
     Ok(())
 }
@@ -717,32 +797,94 @@ fn load_rules_from_directory(
     rules
 }
 
+// UPDATED: Built-in fallback rules now use generic placeholders.
 fn get_hardcoded_default_rules() -> Vec<Rule> {
-    vec![Rule {
-        id: "connection_refused".to_string(),
-        name: "Connection Refused".to_string(),
-        severity: "high".to_string(),
-
-        error_patterns: vec![
-            "connection refused".to_string(),
-        ],
-
-        context_patterns: Vec::new(),
-        trigger: Trigger::Log,
-
-        remediation: Remediation::ServiceRestart {
-            service: "cron".to_string(),
+    vec![
+        Rule {
+            id: "connection_refused".to_string(),
+            name: "Connection Refused (service)".to_string(),
+            severity: "high".to_string(),
+            error_patterns: vec![
+                "connection refused".to_string(),
+            ],
+            context_patterns: Vec::new(),
+            trigger: Trigger::Log,
+            remediation: Remediation::ServiceRestart {
+                service: "TARGET_SERVICE".to_string(),
+            },
+            verification: Verification::ServiceActive {
+                service: "TARGET_SERVICE".to_string(),
+            },
+            action: "auto_recover".to_string(),
+            priority: 10,
         },
-
-        verification: Verification::ServiceActive {
-            service: "cron".to_string(),
+        Rule {
+            id: "container_exit_137".to_string(),
+            name: "Container OOM / SIGKILL (exit 137)".to_string(),
+            severity: "critical".to_string(),
+            error_patterns: vec![
+                "exit code 137".to_string(),
+                "oom".to_string(),
+            ],
+            context_patterns: Vec::new(),
+            trigger: Trigger::DockerExit {
+                container: "TARGET_CONTAINER".to_string(),
+                exit_codes: vec![137],
+            },
+            remediation: Remediation::ContainerRestart {
+                container: "TARGET_CONTAINER".to_string(),
+            },
+            verification: Verification::ContainerRunning {
+                container: "TARGET_CONTAINER".to_string(),
+            },
+            action: "auto_recover".to_string(),
+            priority: 20,
         },
-
-        action: "auto_recover".to_string(),
-        priority: 10,
-    }]
+        Rule {
+            id: "container_unhealthy".to_string(),
+            name: "Container Unhealthy".to_string(),
+            severity: "high".to_string(),
+            error_patterns: vec![
+                "health status unhealthy".to_string(),
+            ],
+            context_patterns: Vec::new(),
+            trigger: Trigger::DockerHealth {
+                container: "TARGET_CONTAINER".to_string(),
+                status: "unhealthy".to_string(),
+            },
+            remediation: Remediation::ContainerRestart {
+                container: "TARGET_CONTAINER".to_string(),
+            },
+            verification: Verification::ContainerHealthy {
+                container: "TARGET_CONTAINER".to_string(),
+            },
+            action: "auto_recover".to_string(),
+            priority: 20,
+        },
+        Rule {
+            id: "container_oom".to_string(),
+            name: "Container OOM Event".to_string(),
+            severity: "critical".to_string(),
+            error_patterns: vec![
+                "oom event detected".to_string(),
+            ],
+            context_patterns: Vec::new(),
+            trigger: Trigger::DockerOom {
+                container: "TARGET_CONTAINER".to_string(),
+            },
+            remediation: Remediation::ContainerRestart {
+                container: "TARGET_CONTAINER".to_string(),
+            },
+            verification: Verification::ContainerRunning {
+                container: "TARGET_CONTAINER".to_string(),
+            },
+            action: "auto_recover".to_string(),
+            priority: 25,
+        },
+    ]
 }
 
+// UPDATED: Filters out disabled rules from config.
 fn load_all_rules() -> Vec<Rule> {
     let mut rules = Vec::new();
     let mut seen_ids = HashSet::new();
@@ -782,6 +924,20 @@ fn load_all_rules() -> Vec<Rule> {
         );
 
         rules = get_hardcoded_default_rules();
+    }
+
+    // NEW: Filter out disabled rules from config.
+    let disabled: HashSet<String> = load_config()
+        .map(|c| c.disabled_rules.iter().map(|id| id.trim().to_lowercase()).collect())
+        .unwrap_or_default();
+
+    if !disabled.is_empty() {
+        let before = rules.len();
+        rules.retain(|r| !disabled.contains(&r.id.trim().to_lowercase()));
+        let removed = before - rules.len();
+        if removed > 0 {
+            log_incident(&format!("[RULES] {} rule(s) disabled by config", removed));
+        }
     }
 
     rules.sort_by(|a, b| {
@@ -1047,18 +1203,33 @@ fn execute_command(
     }
 }
 
+// UPDATED: Now captures stdout/stderr from pipes.
 fn execute_command_capture(executable: &str, args: &[String], timeout_secs: u64) -> Result<(i32, String, String), String> {
     log_incident(&format!("[EXEC] {} {}", executable, args.join(" ")));
     let mut child = Command::new(executable)
         .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("Failed to start {}: {}", executable, e))?;
+
+    let mut stdout_pipe = child.stdout.take();
+    let mut stderr_pipe = child.stderr.take();
+
     let start = Instant::now();
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok((status.code().unwrap_or(-1), String::new(), String::new())),
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                let mut stderr = String::new();
+                if let Some(mut out) = stdout_pipe.take() {
+                    let _ = out.read_to_string(&mut stdout);
+                }
+                if let Some(mut err) = stderr_pipe.take() {
+                    let _ = err.read_to_string(&mut stderr);
+                }
+                return Ok((status.code().unwrap_or(-1), stdout, stderr));
+            }
             Ok(None) if start.elapsed() >= Duration::from_secs(timeout_secs) => {
                 let _ = child.kill();
                 let _ = child.wait();
@@ -1070,6 +1241,7 @@ fn execute_command_capture(executable: &str, args: &[String], timeout_secs: u64)
     }
 }
 
+// UPDATED: Drains pipes on background threads to prevent deadlock.
 fn execute_command_sequence(
     commands: &[String],
     verifications: &[Verification],
@@ -1138,43 +1310,28 @@ fn execute_command_sequence(
             .spawn()
             .map_err(|e| format!("Command {} failed to start: {}", step, e))?;
 
+        let mut stdout_pipe = child.stdout.take();
+        let mut stderr_pipe = child.stderr.take();
+
+        let stdout_handle = stdout_pipe.take().map(|mut reader| {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let _ = reader.read_to_string(&mut buf);
+                buf
+            })
+        });
+        let stderr_handle = stderr_pipe.take().map(|mut reader| {
+            std::thread::spawn(move || {
+                let mut buf = String::new();
+                let _ = reader.read_to_string(&mut buf);
+                buf
+            })
+        });
+
         let start = Instant::now();
-        loop {
+        let status = loop {
             match child.try_wait() {
-                Ok(Some(status)) => {
-                    let stdout = child.stdout.take().map(|mut reader| {
-                        let mut buf = String::new();
-                        let _ = reader.read_to_string(&mut buf);
-                        buf
-                    }).unwrap_or_default();
-                    let stderr = child.stderr.take().map(|mut reader| {
-                        let mut buf = String::new();
-                        let _ = reader.read_to_string(&mut buf);
-                        buf
-                    }).unwrap_or_default();
-
-                    if !status.success() {
-                        let detail = if !stderr.trim().is_empty() {
-                            format!(" stderr={}", stderr.trim())
-                        } else if !stdout.trim().is_empty() {
-                            format!(" stdout={}", stdout.trim())
-                        } else {
-                            String::new()
-                        };
-
-                        return Err(format!(
-                            "Command {} exited with status {}.{}",
-                            step, status, detail
-                        ));
-                    }
-
-                    log_incident(&format!(
-                        "[COMMAND {} / {}] Completed successfully",
-                        step,
-                        commands.len()
-                    ));
-                    break;
-                }
+                Ok(Some(status)) => break status,
                 Ok(None) if start.elapsed() >= Duration::from_secs(COMMAND_TIMEOUT_SECS) => {
                     let _ = child.kill();
                     let _ = child.wait();
@@ -1193,7 +1350,35 @@ fn execute_command_sequence(
                     ));
                 }
             }
+        };
+
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+
+        if !status.success() {
+            let detail = if !stderr.trim().is_empty() {
+                format!(" stderr={}", stderr.trim())
+            } else if !stdout.trim().is_empty() {
+                format!(" stdout={}", stdout.trim())
+            } else {
+                String::new()
+            };
+
+            return Err(format!(
+                "Command {} exited with status {}.{}",
+                step, status, detail
+            ));
         }
+
+        log_incident(&format!(
+            "[COMMAND {} / {}] Completed successfully",
+            step,
+            commands.len()
+        ));
 
         sleep(Duration::from_secs(VERIFY_DELAY_SECS));
 
@@ -1275,6 +1460,7 @@ fn container_display_name(id: &str) -> String {
     docker_inspect_state(id).and_then(|v| v.get("Name").and_then(|n| n.as_str()).map(|s| s.trim_start_matches('/').to_string())).unwrap_or_else(|| id.to_string())
 }
 
+// UPDATED: Malformed lines are now skipped instead of aborting the whole lookup.
 fn env_value(name: &str) -> Option<String> {
     if let Ok(value) = std::env::var(name) {
         if !value.trim().is_empty() {
@@ -1288,7 +1474,9 @@ fn env_value(name: &str) -> Option<String> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (key, value) = line.split_once('=')?;
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         if key.trim() == name {
             let value = value.trim().trim_matches('"').trim_matches('\'');
             if !value.is_empty() {
@@ -1380,8 +1568,6 @@ fn alert_body(incident: &str, rule: Option<&Rule>, status: &str) -> String {
 }
 
 fn remediation_allowed() -> bool {
-    // Development/testing mode: license enforcement is intentionally disabled.
-    // Production should validate the license with the Aegira licensing service here.
     if !LICENSE_ENFORCEMENT_ENABLED {
         return true;
     }
@@ -1389,6 +1575,30 @@ fn remediation_allowed() -> bool {
 }
 
 fn perform_remediation(remediation: &Remediation, ctx: Option<&IncidentContext>, rule: &Rule) -> Result<(), String> {
+    // NEW: Runtime safety net — block destructive commands even if they slipped past validation.
+    match remediation {
+        Remediation::Command { executable, args } => {
+            let full = format!("{} {}", executable, args.join(" "));
+            if let Some(reason) = is_destructive_command(&full) {
+                return Err(format!("Blocked destructive command ({}): {}", reason, full));
+            }
+        }
+        Remediation::ContainerExec { args, .. } => {
+            let full = args.join(" ");
+            if let Some(reason) = is_destructive_command(&full) {
+                return Err(format!("Blocked destructive container_exec ({}): {}", reason, full));
+            }
+        }
+        Remediation::CommandSequence { commands, .. } => {
+            for cmd in commands {
+                if let Some(reason) = is_destructive_command(cmd) {
+                    return Err(format!("Blocked destructive command in sequence ({}): {}", reason, cmd));
+                }
+            }
+        }
+        _ => {}
+    }
+
     match remediation {
         Remediation::ServiceRestart { service } => {
             let target = resolve_service_target(service)?;
@@ -1437,19 +1647,22 @@ fn verify_recovery(verification: &Verification, ctx: Option<&IncidentContext>, r
             match Command::new(docker).args(["inspect", "-f", "{{.State.Running}}", target.as_str()]).output() { Ok(o)=>o.status.success() && String::from_utf8_lossy(&o.stdout).trim()=="true", Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); false} }
         }
         Verification::ContainerHealthy { container } => {
-            let target = match resolve_container_target(container) { Ok(v)=>v, Err(_)=>return false };
-            let docker = match docker_binary() { Ok(v)=>v, Err(_)=>return false };
+            let target = match resolve_container_target(container) { Ok(v)=>v, Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); return false;} };
+            let docker = match docker_binary() { Ok(v)=>v, Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); return false;} };
             match Command::new(docker).args(["inspect", "-f", "{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}", target.as_str()]).output() {
                 Ok(o)=>o.status.success() && String::from_utf8_lossy(&o.stdout).trim().eq_ignore_ascii_case("healthy"),
-                Err(_)=>false,
+                Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); false},
             }
         }
         Verification::ContainerProbeSuccess { container, executable, args } => {
-            let target = match resolve_container_target(container) { Ok(v)=>v, Err(_)=>return false };
-            let docker = match docker_binary() { Ok(v)=>v, Err(_)=>return false };
+            let target = match resolve_container_target(container) { Ok(v)=>v, Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); return false;} };
+            let docker = match docker_binary() { Ok(v)=>v, Err(e)=>{log_incident(&format!("[VERIFY ERROR] {}",e)); return false;} };
             let mut full = vec!["exec".to_string(), target, executable.clone()];
             full.extend(args.iter().cloned());
-            match execute_command_capture(docker, &full, COMMAND_TIMEOUT_SECS) { Ok((code,_,_))=>code==0, Err(_)=>false }
+            match execute_command_capture(docker, &full, COMMAND_TIMEOUT_SECS) {
+                Ok((code,_,_)) => code == 0,
+                Err(e) => { log_incident(&format!("[VERIFY ERROR] ContainerProbeSuccess failed: {}", e)); false }
+            }
         }
         Verification::HttpStatus { url, expected_status } => {
             let client = match Client::builder().timeout(Duration::from_secs(COMPOSIO_TIMEOUT_SECS)).build() { Ok(v)=>v, Err(_)=>return false };
@@ -1460,7 +1673,10 @@ fn verify_recovery(verification: &Verification, ctx: Option<&IncidentContext>, r
         }
         Verification::CommandSuccess { executable, args } => {
             let expanded: Vec<String> = args.iter().map(|a| expand_command_arg(a, ctx, rule)).collect();
-            match execute_command_capture(executable, &expanded, COMMAND_TIMEOUT_SECS) { Ok((code,_,_))=>code==0, Err(_)=>false }
+            match execute_command_capture(executable, &expanded, COMMAND_TIMEOUT_SECS) {
+                Ok((code,_,_)) => code == 0,
+                Err(e) => { log_incident(&format!("[VERIFY ERROR] CommandSuccess failed: {}", e)); false }
+            }
         }
     }
 }
@@ -1469,14 +1685,10 @@ fn recover_with_rule(
     rule: &Rule,
     ctx: &IncidentContext,
 ) -> Result<(), String> {
+    // UPDATED: Single compact log line instead of multiple.
     log_incident(&format!(
-        "[MATCH] Rule: {}",
-        rule.name
-    ));
-
-    log_incident(&format!(
-        "[MATCH] Rule ID: {}",
-        rule.id
+        "[RECOVER] rule_id={} name={}",
+        rule.id, rule.name
     ));
 
     if matches!(rule.remediation, Remediation::AlertOnly) {
@@ -1526,8 +1738,6 @@ fn recover_with_rule(
 }
 
 fn make_incident_key(rule: &Rule, ctx: &IncidentContext) -> String {
-    // Cooldowns must use stable identity, never transient Docker logs or HTTP
-    // error text. Otherwise every changed log line becomes a new incident.
     format!(
         "{}:{}:{}:{}",
         rule.id.to_lowercase(),
@@ -1576,6 +1786,7 @@ fn describe_remediation(remediation: &Remediation) -> String {
     }
 }
 
+// UPDATED: Single compact log line instead of multiple.
 fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashMap<String, Instant>) {
     cleanup_cooldowns(cooldowns);
     let start = Instant::now();
@@ -1595,9 +1806,17 @@ fn process_incident(rules: &[Rule], ctx: &IncidentContext, cooldowns: &mut HashM
     let key = make_incident_key(rule, ctx);
     if cooldowns.contains_key(&key) { return; }
     cooldowns.insert(key, Instant::now());
-    log_incident(&format!("[WATCHER] Incident detected: {}", ctx.incident));
-    log_incident(&format!("[MATCH] Rule: {}", rule.name));
-    log_incident(&format!("[MATCH] Confidence score: {}", score));
+
+    // UPDATED: Single compact log line.
+    log_incident(&format!(
+        "[WATCHER] source={} container={} rule={} score={} incident={}",
+        ctx.source,
+        ctx.container.as_deref().unwrap_or("-"),
+        rule.name,
+        score,
+        ctx.incident.lines().next().unwrap_or("").trim()
+    ));
+
     let action = rule.action.trim().to_lowercase();
     if action == "dry_run" {
         log_incident(&format!("[DRY RUN] Rule '{}' matched. Would execute: {}", rule.id, describe_remediation(&rule.remediation)));
@@ -1744,21 +1963,17 @@ fn docker_container_is_running(container: &str) -> Result<bool, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim() == "true")
 }
 
-/// For loopback URLs, prove that the URL's published host port belongs to the
-/// named container. This prevents an HTTP rule from accidentally recovering a
-/// different container that happens to expose the same endpoint.
 fn http_endpoint_matches_container(url: &str, container: &str) -> Result<(), String> {
     let parsed = Url::parse(url).map_err(|e| format!("Invalid HTTP health URL '{}': {}", url, e))?;
     let host = parsed.host_str().unwrap_or("");
     if host != "127.0.0.1" && host != "localhost" {
-        // Non-loopback endpoints may be reverse-proxied or externally routed.
-        // The explicit container field still binds the recovery rule to one
-        // container; only local published-port ownership can be proven here.
         return Ok(());
     }
 
     let host_port = parsed.port_or_known_default()
         .ok_or_else(|| format!("Could not determine port for HTTP health URL '{}'", url))?;
+    let host_port_str = host_port.to_string();
+
     let state = docker_inspect_state(container)
         .ok_or_else(|| format!("Container '{}' does not exist; cannot bind HTTP endpoint '{}'", container, url))?;
     let ports = state
@@ -1770,7 +1985,7 @@ fn http_endpoint_matches_container(url: &str, container: &str) -> Result<(), Str
     for bindings in ports.values() {
         if let Some(bindings) = bindings.as_array() {
             for binding in bindings {
-                if binding.get("HostPort").and_then(|v| v.as_str()) == Some(&host_port.to_string()) {
+                if binding.get("HostPort").and_then(|v| v.as_str()) == Some(host_port_str.as_str()) {
                     return Ok(());
                 }
             }
@@ -1835,9 +2050,6 @@ fn run_http_health_monitor() {
         for rule in &rules {
             if let Trigger::HttpHealth { url, container, expected_status, .. } = &rule.trigger {
                 let Some(container_spec) = container.as_deref() else {
-                    // Invalid rules are normally rejected by validation. Keep
-                    // this guard so a malformed rule can never trigger a blind
-                    // recovery if it slips in through a future code path.
                     continue;
                 };
                 let target = match resolve_trigger_container(container_spec) {
@@ -1977,9 +2189,13 @@ fn print_usage() {
     println!("  aegira install");
     println!("  aegira status");
     println!("  aegira show-rules");
+    println!("  aegira rules list");
+    println!("  aegira rules disable <rule-id>");
+    println!("  aegira rules enable <rule-id>");
     println!("  aegira history");
     println!("  aegira configure service <name>");
     println!("  aegira configure container <name>");
+    println!("  aegira configure auto <name> [--container]");
     println!("  aegira configure alerts <on|off> [recipient_email]");
     println!("  aegira license");
     println!("  aegira run");
@@ -2129,15 +2345,10 @@ fn run_install() -> Result<(), String> {
 
     let mut rule_candidates: Vec<PathBuf> = Vec::new();
 
-    // First check beside the executable.
     if let Some(parent) = executable.parent() {
         rule_candidates.push(parent.join("rules.json"));
         rule_candidates.push(parent.join("rules/builtin/rules.json"));
 
-        // Then walk upward through the project directories.
-        // This supports the normal Cargo layout:
-        // project/rules.json
-        // project/target/release/aegira
         let mut ancestor = parent;
         while let Some(next) = ancestor.parent() {
             if next == ancestor {
@@ -2148,7 +2359,6 @@ fn run_install() -> Result<(), String> {
         }
     }
 
-    // Finally check the directory from which the installer was launched.
     rule_candidates.push(PathBuf::from("rules.json"));
     rule_candidates.push(PathBuf::from("rules/builtin/rules.json"));
 
@@ -2250,6 +2460,46 @@ fn run_configure(args: &[String]) -> Result<(), String> {
     save_config(&config)
 }
 
+// NEW: One-command setup. Automatically chooses service vs container.
+fn run_configure_auto(args: &[String]) -> Result<(), String> {
+    if unsafe { libc_geteuid() } != 0 {
+        return Err("Configuration must be run as root. Use sudo.".to_string());
+    }
+    if args.len() < 4 {
+        return Err("Usage: sudo aegira configure auto <name> [--container]".to_string());
+    }
+    let name = args[3].trim();
+    let is_container = args.iter().any(|a| a == "--container");
+
+    if name.is_empty() || name == "TARGET_SERVICE" || name == "TARGET_CONTAINER" {
+        return Err("Target name cannot be empty or a placeholder.".to_string());
+    }
+
+    let mut config = load_config()?;
+    if is_container {
+        config.target_container = Some(name.to_string());
+        log_incident(&format!("[CONFIG] Auto-configured container: {}", name));
+        println!("[CONFIG] Container target set: {}", name);
+        println!("[CONFIG] Built-in rules will now target this container.");
+    } else {
+        if normalize_target(name) == SELF_SERVICE {
+            return Err("Refusing to target Aegira itself.".to_string());
+        }
+        config.target_service = Some(name.to_string());
+        log_incident(&format!("[CONFIG] Auto-configured service: {}", name));
+        println!("[CONFIG] Service target set: {}", name);
+        println!("[CONFIG] Built-in rules will now target this service.");
+    }
+    save_config(&config)?;
+
+    if let Ok(systemctl) = systemctl_binary() {
+        let _ = execute_command(systemctl, &["restart", "aegira.service"]);
+    }
+
+    println!("[CONFIG] Aegira restarted with new configuration.");
+    Ok(())
+}
+
 fn run_configure_alerts(args: &[String]) -> Result<(), String> {
     if unsafe { libc_geteuid() } != 0 {
         return Err("Configuration must be run as root. Use sudo.".to_string());
@@ -2281,10 +2531,6 @@ fn run_configure_alerts(args: &[String]) -> Result<(), String> {
 }
 
 fn run_license(_args: &[String]) -> Result<(), String> {
-    // License-key enforcement is intentionally disabled for development/testing.
-    // Production flow: user purchases a subscription, receives a license key,
-    // enters it once, and Aegira validates the subscription with the licensing service.
-    // The billing provider renews the subscription monthly until cancellation.
     println!("[LICENSE] Pro license enforcement is disabled for development/testing.");
     println!("[LICENSE] No payment or license key is required in this build.");
     Ok(())
@@ -2321,6 +2567,78 @@ fn run_show_rules() -> Result<(), String> {
     println!("Active Aegira rules: {}", rules.len());
     for rule in rules {
         println!("- {} ({})", rule.id, rule.name);
+    }
+    Ok(())
+}
+
+// NEW: Disable a rule via config.
+fn run_rules_disable(rule_id: &str) -> Result<(), String> {
+    if unsafe { libc_geteuid() } != 0 {
+        return Err("Configuration must be run as root. Use sudo.".to_string());
+    }
+    let rule_id = rule_id.trim();
+    if rule_id.is_empty() {
+        return Err("Rule ID cannot be empty.".to_string());
+    }
+    let mut config = load_config()?;
+    let normalized = rule_id.to_lowercase();
+    if !config.disabled_rules.iter().any(|r| r.to_lowercase() == normalized) {
+        config.disabled_rules.push(rule_id.to_string());
+        save_config(&config)?;
+    }
+    log_incident(&format!("[CONFIG] Rule disabled: {}", rule_id));
+    println!("[RULES] Disabled: {}", rule_id);
+    Ok(())
+}
+
+// NEW: Enable a previously disabled rule.
+fn run_rules_enable(rule_id: &str) -> Result<(), String> {
+    if unsafe { libc_geteuid() } != 0 {
+        return Err("Configuration must be run as root. Use sudo.".to_string());
+    }
+    let rule_id = rule_id.trim();
+    if rule_id.is_empty() {
+        return Err("Rule ID cannot be empty.".to_string());
+    }
+    let mut config = load_config()?;
+    let normalized = rule_id.to_lowercase();
+    let before = config.disabled_rules.len();
+    config.disabled_rules.retain(|r| r.to_lowercase() != normalized);
+    if config.disabled_rules.len() == before {
+        println!("[RULES] Rule was not disabled: {}", rule_id);
+        return Ok(());
+    }
+    save_config(&config)?;
+    log_incident(&format!("[CONFIG] Rule enabled: {}", rule_id));
+    println!("[RULES] Enabled: {}", rule_id);
+    Ok(())
+}
+
+// NEW: List all rules with enabled/disabled status.
+fn run_rules_list() -> Result<(), String> {
+    let rules = load_all_rules();
+    let config = load_config().unwrap_or_default();
+    let disabled: HashSet<String> = config.disabled_rules
+        .iter()
+        .map(|id| id.trim().to_lowercase())
+        .collect();
+
+    println!();
+    println!("Active rules: {}", rules.len());
+    println!("Disabled rules: {}", disabled.len());
+    println!();
+    println!("{:<30} {:<40} {:<10}", "ID", "NAME", "STATUS");
+    println!("{}", "-".repeat(82));
+    for rule in &rules {
+        let status = if disabled.contains(&rule.id.to_lowercase()) { "disabled" } else { "enabled" };
+        println!("{:<30} {:<40} {:<10}", rule.id, rule.name, status);
+    }
+    if !disabled.is_empty() {
+        println!();
+        println!("Disabled (not active):");
+        for id in &config.disabled_rules {
+            println!("  - {}", id);
+        }
     }
     Ok(())
 }
@@ -2475,6 +2793,55 @@ mod tests {
         let rule: Rule = serde_json::from_str(json).unwrap();
         assert!(matches!(rule.trigger, Trigger::Log));
     }
+
+    // NEW: Destructive command detection tests.
+    #[test]
+    fn detects_destructive_commands() {
+        assert!(is_destructive_command("rm -rf /").is_some());
+        assert!(is_destructive_command("rm -rf /*").is_some());
+        assert!(is_destructive_command("dd if=/dev/zero of=/dev/sda").is_some());
+        assert!(is_destructive_command("mkfs.ext4 /dev/sda1").is_some());
+        assert!(is_destructive_command("shutdown -h now").is_some());
+        assert!(is_destructive_command("reboot").is_some());
+        assert!(is_destructive_command("kill -9 1").is_some());
+        assert!(is_destructive_command(":(){ :|:& };:").is_some());
+    }
+
+    #[test]
+    fn allows_safe_commands() {
+        assert!(is_destructive_command("systemctl restart nginx").is_none());
+        assert!(is_destructive_command("docker restart my-app").is_none());
+        assert!(is_destructive_command("rm -rf /tmp/aegira-test").is_none());
+        assert!(is_destructive_command("curl http://localhost/health").is_none());
+    }
+
+    #[test]
+    fn blocks_destructive_rule_at_validation() {
+        let json = r#"{
+            "id":"bad",
+            "name":"bad",
+            "error_patterns":["x"],
+            "remediation":{"type":"command","executable":"rm","args":["-rf","/"]},
+            "verification":{"type":"none"}
+        }"#;
+        let rule: Rule = serde_json::from_str(json).unwrap();
+        assert!(validate_rule(&rule).is_err());
+    }
+
+    #[test]
+    fn generic_placeholder_targets_validate() {
+        let json = r#"{
+            "id":"generic",
+            "name":"generic",
+            "error_patterns":["x"],
+            "trigger":{"type":"docker_exit","container":"TARGET_CONTAINER","exit_codes":[137]},
+            "remediation":{"type":"container_restart","container":"TARGET_CONTAINER"},
+            "verification":{"type":"container_running","container":"TARGET_CONTAINER"},
+            "action":"auto_recover"
+        }"#;
+        let rule: Rule = serde_json::from_str(json).unwrap();
+        assert!(validate_rule(&rule).is_ok());
+    }
 }
 
 fn main() {
@@ -2485,10 +2852,10 @@ fn main() {
         "install" => run_install(),
         "status" => run_status(),
         "configure" => {
-            if args.get(2).map(String::as_str) == Some("alerts") {
-                run_configure_alerts(&args)
-            } else {
-                run_configure(&args)
+            match args.get(2).map(String::as_str) {
+                Some("alerts") => run_configure_alerts(&args),
+                Some("auto") => run_configure_auto(&args),
+                _ => run_configure(&args),
             }
         }
         "license" => run_license(&args),
@@ -2504,6 +2871,24 @@ fn main() {
                 Err(e)
             } else {
                 run_show_rules()
+            }
+        }
+        "rules" => {
+            if let Err(e) = ensure_environment_setup() {
+                Err(e)
+            } else {
+                match args.get(2).map(String::as_str) {
+                    Some("list") => run_rules_list(),
+                    Some("disable") => match args.get(3) {
+                        Some(id) => run_rules_disable(id),
+                        None => Err("Usage: aegira rules disable <rule-id>".to_string()),
+                    },
+                    Some("enable") => match args.get(3) {
+                        Some(id) => run_rules_enable(id),
+                        None => Err("Usage: aegira rules enable <rule-id>".to_string()),
+                    },
+                    _ => Err("Usage: aegira rules <list|disable|enable> [rule-id]".to_string()),
+                }
             }
         }
         "run" => {
