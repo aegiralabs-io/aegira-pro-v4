@@ -20,8 +20,8 @@ const CONFIG_PATH: &str = "/etc/aegira/config.json";
 
 const POLL_INTERVAL_SECS: u64 = 2;
 const COMMAND_TIMEOUT_SECS: u64 = 20;
-const VERIFY_DELAY_SECS: u64 = 2;
-const MAX_VERIFY_ATTEMPTS: u32 = 5;
+const VERIFY_DELAY_SECS: u64 = 3;
+const MAX_VERIFY_ATTEMPTS: u32 = 10;
 const INCIDENT_COOLDOWN_SECS: u64 = 30;
 const INCIDENT_COOLDOWN_MAX_SECS: u64 = 600;
 const MAX_INCIDENT_LOG_BYTES: u64 = 10 * 1024 * 1024;
