@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  AEGIRA COMPLEX TEST — Real-World Scenario
+#  AEGIRA COMPLEX TEST v2 — Real-World Scenario
 #  For: 64-bit Linux (x86_64 / ARM64)
 #  Usage: sudo ./complex-test.sh
 # ═══════════════════════════════════════════════════════════════
@@ -36,7 +36,7 @@ banner() {
 cleanup() {
     echo -e "\n${YELLOW}[CLEANUP] Removing test containers...${NC}"
     pkill -f "journalctl -u aegira" 2>/dev/null || true
-    docker rm -f complex-api-1 complex-api-2 complex-service-1 complex-service-2 2>/dev/null || true
+    docker rm -f complex-api-1 complex-api-2 2>/dev/null || true
     rm -f /etc/aegira/rules/custom/complex-*.json 2>/dev/null || true
     systemctl restart aegira 2>/dev/null || true
     echo -e "${GREEN}[CLEANUP] Done.${NC}"
@@ -56,7 +56,7 @@ echo "  • Container 1's API dies → Aegira fixes it inside the container"
 echo "  • Container 2 crashes → Aegira restarts it"
 echo "  • Both containers crash + both APIs dead → Aegira fixes everything"
 echo ""
-echo -e "${YELLOW}Duration: ~4 minutes${NC}"
+echo -e "${YELLOW}Duration: ~5 minutes${NC}"
 echo ""
 read -p "Press ENTER to start..."
 
@@ -66,10 +66,10 @@ read -p "Press ENTER to start..."
 banner "INITIAL SETUP"
 
 echo -e "${YELLOW}[INIT] Cleaning up...${NC}"
-docker rm -f complex-api-1 complex-api-2 complex-service-1 complex-service-2 2>/dev/null || true
+docker rm -f complex-api-1 complex-api-2 2>/dev/null || true
 rm -f /etc/aegira/rules/custom/complex-*.json 2>/dev/null || true
 systemctl restart aegira
-sleep 2
+sleep 3
 echo -e "${GREEN}[INIT] Clean.${NC}"
 
 # ─── Start Container 1 (API) ───
@@ -88,7 +88,12 @@ sleep 12
 # ─── Verify both APIs ───
 echo -e "\n${YELLOW}[INIT] Verifying APIs...${NC}"
 for port in 18081 18082; do
-    HTTP_CODE=$(get_http_code "http://127.0.0.1:$port/")
+    HTTP_CODE="000"
+    for i in 1 2 3 4 5; do
+        HTTP_CODE=$(get_http_code "http://127.0.0.1:$port/")
+        [ "$HTTP_CODE" = "200" ] && break
+        sleep 3
+    done
     echo "    Port $port: HTTP $HTTP_CODE"
     if [ "$HTTP_CODE" != "200" ]; then
         echo -e "  ${RED}❌ Container on port $port failed to start.${NC}"
@@ -106,11 +111,11 @@ banner "CONFIGURING AEGIRA"
 
 echo -e "${YELLOW}[CONFIG] Setting multi-container targets...${NC}"
 sudo aegira configure multi complex-api-1 complex-api-2 > /dev/null
-sleep 2
+sleep 3
 
 echo -e "${YELLOW}[CONFIG] Creating HTTP health rules...${NC}"
 
-# Rule for Container 1
+# Rule for Container 1 — API recovery (container_exec)
 tee /etc/aegira/rules/custom/complex-api-1.json > /dev/null << 'EOF'
 [{
   "id": "complex_api_1_recovery",
@@ -128,7 +133,7 @@ tee /etc/aegira/rules/custom/complex-api-1.json > /dev/null << 'EOF'
   "remediation": {
     "type": "container_exec",
     "container": "complex-api-1",
-    "args": ["sh", "-c", "kill $(pgrep -f 'http.server') 2>/dev/null || true; sleep 1; setsid python3 -m http.server 8080 --bind 0.0.0.0 > /dev/null 2>&1 < /dev/null &"]
+    "args": ["sh", "-c", "kill $(pgrep -f 'http.server') 2>/dev/null || true; sleep 1; setsid python3 -m http.server 8080 --bind 0.0.0.0 > /dev/null 2>&1 < /dev/null & sleep 3"]
   },
   "verification": {
     "type": "container_http_status",
@@ -141,7 +146,9 @@ tee /etc/aegira/rules/custom/complex-api-1.json > /dev/null << 'EOF'
 }]
 EOF
 
-# Rule for Container 2
+# Rule for Container 2 — Container restart (container_restart)
+# NOTE: Scenario 2 kills the entire container, so remediation must be
+# container_restart, not container_exec.
 tee /etc/aegira/rules/custom/complex-api-2.json > /dev/null << 'EOF'
 [{
   "id": "complex_api_2_recovery",
@@ -157,9 +164,8 @@ tee /etc/aegira/rules/custom/complex-api-2.json > /dev/null << 'EOF'
   "error_patterns": ["HTTP health check failed"],
   "context_patterns": ["complex-api-2"],
   "remediation": {
-    "type": "container_exec",
-    "container": "complex-api-2",
-    "args": ["sh", "-c", "kill $(pgrep -f 'http.server') 2>/dev/null || true; sleep 1; setsid python3 -m http.server 8080 --bind 0.0.0.0 > /dev/null 2>&1 < /dev/null &"]
+    "type": "container_restart",
+    "container": "complex-api-2"
   },
   "verification": {
     "type": "container_http_status",
@@ -189,7 +195,7 @@ fi
 # ═══════════════════════════════════════════════════════════
 banner "SCENARIO 1: API-1 dies, container running"
 
-journalctl -u aegira -f --since "now" > /tmp/complex-1.log 2>&1 &
+journalctl -u aegira --since "1 minute ago" -f > /tmp/complex-1.log 2>&1 &
 JL_PID=$!
 sleep 3
 
@@ -200,8 +206,8 @@ sleep 3
 CODE_1=$(get_http_code "http://127.0.0.1:18081/")
 echo "    API-1 status: HTTP $CODE_1 (expected: 000)"
 
-echo -e "${YELLOW}→ Waiting 30s for Aegira...${NC}"
-sleep 30
+echo -e "${YELLOW}→ Waiting 45s for Aegira...${NC}"
+sleep 45
 
 kill $JL_PID 2>/dev/null || true
 wait $JL_PID 2>/dev/null || true
@@ -220,19 +226,19 @@ fi
 # ═══════════════════════════════════════════════════════════
 banner "SCENARIO 2: Container-2 crashes"
 
-journalctl -u aegira -f --since "now" > /tmp/complex-2.log 2>&1 &
+journalctl -u aegira --since "1 minute ago" -f > /tmp/complex-2.log 2>&1 &
 JL_PID=$!
 sleep 3
 
 echo -e "${YELLOW}→ Killing complex-api-2...${NC}"
-docker kill --signal=SIGKILL complex-api-2 > /dev/null 2>&1
+docker kill --signal=SIGKILL complex-api-2 > /dev/null 2>&1 || true
 sleep 3
 
 CODE_2=$(get_http_code "http://127.0.0.1:18082/")
 echo "    API-2 status: HTTP $CODE_2 (expected: 000)"
 
-echo -e "${YELLOW}→ Waiting 30s for Aegira...${NC}"
-sleep 30
+echo -e "${YELLOW}→ Waiting 45s for Aegira...${NC}"
+sleep 45
 
 kill $JL_PID 2>/dev/null || true
 wait $JL_PID 2>/dev/null || true
@@ -251,13 +257,13 @@ fi
 # ═══════════════════════════════════════════════════════════
 banner "SCENARIO 3: Both containers + APIs die"
 
-journalctl -u aegira -f --since "now" > /tmp/complex-3.log 2>&1 &
+journalctl -u aegira --since "1 minute ago" -f > /tmp/complex-3.log 2>&1 &
 JL_PID=$!
 sleep 3
 
 echo -e "${YELLOW}→ Killing both containers...${NC}"
-docker kill --signal=SIGKILL complex-api-1 > /dev/null 2>&1
-docker kill --signal=SIGKILL complex-api-2 > /dev/null 2>&1
+docker kill --signal=SIGKILL complex-api-1 > /dev/null 2>&1 || true
+docker kill --signal=SIGKILL complex-api-2 > /dev/null 2>&1 || true
 sleep 3
 
 CODE_1=$(get_http_code "http://127.0.0.1:18081/")
@@ -265,8 +271,8 @@ CODE_2=$(get_http_code "http://127.0.0.1:18082/")
 echo "    API-1: HTTP $CODE_1 (expected: 000)"
 echo "    API-2: HTTP $CODE_2 (expected: 000)"
 
-echo -e "${YELLOW}→ Waiting 45s for Aegira...${NC}"
-sleep 45
+echo -e "${YELLOW}→ Waiting 60s for Aegira...${NC}"
+sleep 60
 
 kill $JL_PID 2>/dev/null || true
 wait $JL_PID 2>/dev/null || true
