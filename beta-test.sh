@@ -1,6 +1,6 @@
 #!/bin/bash
 # ═══════════════════════════════════════════════════════════════
-#  AEGIRA BETA TEST SUITE
+#  AEGIRA BETA TEST SUITE v2
 #  For: 64-bit Linux (x86_64 / ARM64)
 #  Usage: sudo ./beta-test.sh
 # ═══════════════════════════════════════════════════════════════
@@ -56,7 +56,7 @@ echo "  2. OOM (out-of-memory) recovery"
 echo "  3. Multi-container monitoring"
 echo "  4. HTTP API in-container recovery"
 echo ""
-echo -e "${YELLOW}Duration: ~3 minutes${NC}"
+echo -e "${YELLOW}Duration: ~4 minutes${NC}"
 echo ""
 read -p "Press ENTER to start..."
 
@@ -69,7 +69,7 @@ echo -e "${YELLOW}[INIT] Cleaning up leftover containers...${NC}"
 docker rm -f aegira-beta-1 aegira-beta-2 aegira-beta-api 2>/dev/null || true
 rm -f /etc/aegira/rules/custom/beta-*.json 2>/dev/null || true
 systemctl restart aegira
-sleep 2
+sleep 3
 echo -e "${GREEN}[INIT] Clean.${NC}"
 
 # ═══════════════════════════════════════════════════════════
@@ -84,14 +84,15 @@ docker run -d --name aegira-beta-1 alpine tail -f /dev/null > /dev/null
 sleep 2
 
 sudo aegira configure auto aegira-beta-1 --container > /dev/null
-sleep 2
+sleep 3
 
-journalctl -u aegira -f --since "now" > /tmp/beta-test-1.log 2>&1 &
+# Start log capture with a 1-minute window to catch startup logs
+journalctl -u aegira --since "1 minute ago" -f > /tmp/beta-test-1.log 2>&1 &
 JL_PID=$!
 sleep 2
 
 echo "  → Killing container..."
-docker kill --signal=SIGKILL aegira-beta-1 > /dev/null
+docker kill --signal=SIGKILL aegira-beta-1 > /dev/null || true
 sleep 12
 
 kill $JL_PID 2>/dev/null || true
@@ -103,7 +104,7 @@ else
     echo -e "  ${RED}❌ FAIL${NC} — Logs: /tmp/beta-test-1.log"
 fi
 
-docker rm -f aegira-beta-1 > /dev/null 2>&1
+docker rm -f aegira-beta-1 > /dev/null 2>&1 || true
 
 # ═══════════════════════════════════════════════════════════
 #  TEST 2: OOM Recovery
@@ -123,9 +124,9 @@ while True:
 sleep 2
 
 sudo aegira configure auto aegira-beta-2 --container > /dev/null
-sleep 2
+sleep 3
 
-journalctl -u aegira -f --since "now" > /tmp/beta-test-2.log 2>&1 &
+journalctl -u aegira --since "1 minute ago" -f > /tmp/beta-test-2.log 2>&1 &
 JL_PID=$!
 sleep 2
 
@@ -141,7 +142,7 @@ else
     echo -e "  ${RED}❌ FAIL${NC} — Logs: /tmp/beta-test-2.log"
 fi
 
-docker rm -f aegira-beta-2 > /dev/null 2>&1
+docker rm -f aegira-beta-2 > /dev/null 2>&1 || true
 
 # ═══════════════════════════════════════════════════════════
 #  TEST 3: Multi-Container Monitoring
@@ -156,16 +157,16 @@ docker run -d --name aegira-beta-2 alpine tail -f /dev/null > /dev/null
 sleep 2
 
 sudo aegira configure multi aegira-beta-1 aegira-beta-2 > /dev/null
-sleep 3
+sleep 4
 
-journalctl -u aegira -f --since "now" > /tmp/beta-test-3.log 2>&1 &
+journalctl -u aegira --since "1 minute ago" -f > /tmp/beta-test-3.log 2>&1 &
 JL_PID=$!
 sleep 2
 
 echo "  → Killing both containers..."
-docker kill --signal=SIGKILL aegira-beta-1 > /dev/null 2>&1
+docker kill --signal=SIGKILL aegira-beta-1 > /dev/null 2>&1 || true
 sleep 1
-docker kill --signal=SIGKILL aegira-beta-2 > /dev/null 2>&1
+docker kill --signal=SIGKILL aegira-beta-2 > /dev/null 2>&1 || true
 sleep 20
 
 kill $JL_PID 2>/dev/null || true
@@ -179,7 +180,7 @@ else
     echo -e "  ${YELLOW}Logs:${NC} /tmp/beta-test-3.log"
 fi
 
-docker rm -f aegira-beta-1 aegira-beta-2 > /dev/null 2>&1
+docker rm -f aegira-beta-1 aegira-beta-2 > /dev/null 2>&1 || true
 
 # ═══════════════════════════════════════════════════════════
 #  TEST 4: HTTP API In-Container Recovery
@@ -225,7 +226,7 @@ else
   "remediation": {
     "type": "container_exec",
     "container": "aegira-beta-api",
-    "args": ["sh", "-c", "kill $(pgrep -f 'http.server') 2>/dev/null || true; sleep 1; setsid python3 -m http.server 8080 --bind 0.0.0.0 > /dev/null 2>&1 < /dev/null &"]
+    "args": ["sh", "-c", "kill $(pgrep -f 'http.server') 2>/dev/null || true; sleep 1; setsid python3 -m http.server 8080 --bind 0.0.0.0 > /dev/null 2>&1 < /dev/null & sleep 3"]
   },
   "verification": {
     "type": "container_http_status",
@@ -246,7 +247,7 @@ EOF
     else
         echo -e "  ${GREEN}✅ Rule loaded.${NC}"
 
-        journalctl -u aegira -f --since "now" > /tmp/beta-test-4.log 2>&1 &
+        journalctl -u aegira --since "1 minute ago" -f > /tmp/beta-test-4.log 2>&1 &
         JL_PID=$!
         sleep 3
 
@@ -257,8 +258,8 @@ EOF
         HTTP_CODE=$(get_http_code "http://127.0.0.1:18080/")
         echo "    API after kill: HTTP $HTTP_CODE (expected: 000)"
 
-        echo "  → Waiting 30s for recovery..."
-        sleep 30
+        echo "  → Waiting 45s for recovery..."
+        sleep 45
 
         kill $JL_PID 2>/dev/null || true
         wait $JL_PID 2>/dev/null || true
